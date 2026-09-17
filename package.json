@@ -1,0 +1,31 @@
+{
+  "name": "sustech-print",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "南科大云打印",
+  "main": "desktop/main.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs",
+    "check": "node --check server.mjs && node --check lib/pms.mjs && node --check lib/store.mjs && node --check lib/paths.mjs && node --check desktop/main.mjs && node --check desktop/credentials.mjs && node --check desktop/spool-watcher.mjs",
+    "web:dev": "npm --prefix web run dev",
+    "web:build": "npm --prefix web run build",
+    "app": "npm run web:build && electron .",
+    "app:dev": "electron .",
+    "dist:mac": "npm run web:build && electron-builder --mac",
+    "dist:mac-pkg": "npm run web:build && electron-builder --mac pkg",
+    "dist:win": "npm run web:build && electron-builder --win",
+    "dist:all": "npm run web:build && electron-builder --mac --win"
+  },
+  "devDependencies": {
+    "electron": "^44.4.1",
+    "electron-builder": "^26.15.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "allowScripts": {
+    "electron-winstaller@5.4.0": true
+  }
+}

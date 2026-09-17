@@ -1,0 +1,122 @@
+# electron-builder 打包配置
+#
+# Mac 与 Windows 分开打包（"可以分开打包"）：
+#   npm run dist:mac   ->  dist-app/南科大云打印-1.0.0-arm64.dmg 等
+#   npm run dist:win   ->  dist-app/SUSTechPrint-Setup-1.0.0.exe
+#   npm run dist:all   ->  两个都出
+
+# appId 必须和 driver/macos/sustech-print 里的 APP_BUNDLE_ID 保持一致 ——
+# 没装 .app 时 macOS backend 用 `open -b <这个 id>` 拉起客户端，对不上就叫不起来。
+appId: cn.edu.sustech.print
+productName: 南科大云打印
+copyright: 南科大云打印本地客户端
+
+directories:
+  output: dist-app
+  buildResources: build
+
+# 只打包运行时真正需要的东西：把 reverse/（逆向产物）、screens/、web/src 都排掉
+files:
+  - package.json
+  - server.mjs
+  - lib/**/*
+  - desktop/**/*
+  - web/dist/**/*
+  - "!**/*.map"
+  - "!**/node_modules/**/{test,__tests__,docs,example,examples}/**"
+
+# 打印驱动安装脚本随包附带。
+# 不给顶层 extraResources：那样 mac 包里会塞进 Windows 的 .ps1、Windows 包里
+# 会塞进 driver/macos/test/.work 下的一堆测试产物。按平台各带各的。
+asar: true
+
+mac:
+  category: public.app-category.productivity
+  icon: build/icon.png
+  darkModeSupport: true
+  target:
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+    # pkg 比 dmg 多一样东西：一个以 root 运行的安装脚本。
+    # 正好用它把 CUPS 驱动一起装上（build/pkg-scripts/postinstall），
+    # 这样 macOS 和 Windows 的体验就一致了 —— 装完即用，
+    # 不需要用户再翻 README 手动 sudo 跑 install.sh。
+    - target: pkg
+      arch:
+        - arm64
+        - x64
+  # 本地自用不签名；要分发给别人再去申请 Developer ID 并把这两行删掉
+  identity: null
+  extendInfo:
+    NSHumanReadableCopyright: 南科大云打印本地客户端
+  extraResources:
+    - from: driver/macos
+      to: driver/macos
+
+pkg:
+  installLocation: /Applications
+  # 注意：这个路径是相对 buildResources（也就是 build/）解析的，不是相对项目根。
+  # 写成 build/pkg-scripts 会变成 build/build/pkg-scripts，目录不存在时
+  # electron-builder 会**静默跳过**脚本，打出来的 pkg 看着正常但没有 postinstall。
+  scripts: pkg-scripts
+  # 必须显式关掉。pkgbuild --analyze 生成的模板里 BundleIsRelocatable 默认为 true，
+  # 于是 PackageInfo 里会出现 <relocate> 段；macOS 的 Installer 看到它，就会按
+  # bundle id 在磁盘上找同名 App，**就地覆盖**而不是装到 /Applications。
+  # 实测踩到：App 被装回了构建目录 dist-app/mac-arm64/，/Applications 下什么都没有，
+  # 接着 postinstall 找不到驱动脚本，打印机那步被静默跳过 —— 但安装报告"成功"。
+  isRelocatable: false
+  artifactName: SUSTechPrint-${version}-${arch}.${ext}
+  # 本地自用不签名。要分发给别人需要 Developer ID Installer 证书，
+  # 否则 Gatekeeper 会拦（右键"打开"可以绕过）。
+  identity: null
+
+dmg:
+  artifactName: SUSTechPrint-${version}-${arch}.${ext}
+  title: 南科大云打印 ${version}
+  contents:
+    - x: 140
+      y: 200
+      type: file
+    - x: 400
+      y: 200
+      type: link
+      path: /Applications
+
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+  extraResources:
+    - from: driver/windows
+      to: driver/windows
+
+nsis:
+  # 这个安装包要装一台"全体用户可用"的虚拟打印机，所以必须走 perMachine：
+  #   - 安装时弹一次 UAC，整个安装过程带管理员令牌，
+  #     customInstall（build/installer.nsh）里起的 PowerShell 才有权限
+  #     去 Add-PrinterPort / Add-Printer；
+  #   - 打印机端口指向 %ProgramData%\SUSTechPrint\spool\out.pdf（全机共享），
+  #     per-user 安装会让驱动和 App 看到的目录对不上。
+  # 安装目录仍然可选（allowToChangeInstallationDirectory）。
+  oneClick: false
+  perMachine: true
+  allowElevation: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 南科大云打印
+  uninstallDisplayName: 南科大云打印
+  artifactName: SUSTechPrint-Setup-${version}.${ext}
+  # 保留 %ProgramData%\SUSTechPrint（登录凭据、driver-token、spool），
+  # 免得用户重装一次就得重新登录。打印机队列由 customUnInstall 负责删掉。
+  deleteAppDataOnUninstall: false
+  runAfterFinish: true
+  # 装完文件后跑驱动安装脚本，卸载时跑驱动清理脚本
+  include: build/installer.nsh
+
+# 打包时不要联网去查更新
+publish: null

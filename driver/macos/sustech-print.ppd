@@ -1,0 +1,98 @@
+*PPD-Adobe: "4.3"
+*% =====================================================================
+*% 南科大云打印 —— PDF 直通 PPD
+*%
+*% 这份 PPD 只做一件事：让 CUPS 认为"这台设备直接吃 application/pdf"，
+*% 从而在 PDF 输入时套用 cost 为 0 的 `-`（直通）滤镜，把 PDF 原样交给
+*% backend，不经过 pstops / cgpdftops / Ghostscript。
+*%
+*% 为什么不干脆用 raw 队列：macOS 26 的 lpadmin 已经明确拒绝
+*%   $ lpadmin -p Q -E -v file:/dev/null -m raw
+*%   lpadmin：macOS不再支持原始队列。
+*% 所以只能用"极简 PPD + PDF 直通滤镜"来达到同样的效果。
+*%
+*% 注意：这里**故意**不声明 application/postscript。声明了就会走
+*% cgpdftops（PDF→PS），而本机没有任何 PS→PDF 转换器，等于把作业变成
+*% 无法处理的格式。现在这样，PS 输入会被 CUPS 在提交阶段就拒绝，
+*% 用户能立刻看到错误，而不是等到 backend 里才发现。
+*% =====================================================================
+*FormatVersion: "4.3"
+*FileVersion: "1.0"
+*LanguageEncoding: UTF-8
+*LanguageVersion: Chinese (Simplified)
+*PCFileName: "sustech-print.ppd"
+*Manufacturer: "SUSTech"
+*ModelName: "SUSTech Cloud Print"
+*NickName: "云打印"
+*ShortNickName: "SUSTech Cloud Print"
+*Product: "(云打印)"
+*PSVersion: "(3010.000) 0"
+*LanguageLevel: "3"
+*ColorDevice: True
+*DefaultColorSpace: RGB
+*FileSystem: False
+*Throughput: "1"
+*LandscapeOrientation: Plus90
+*TTRasterizer: Type42
+*cupsVersion: 2.3
+*cupsManualCopies: False
+*cupsModelNumber: 0
+*1284DeviceID: "MFG:SUSTech;MDL:SUSTech Cloud Print;CMD:PDF;"
+*OpenUI *PageSize/纸张: PickOne
+*OrderDependency: 10 AnySetup *PageSize
+*DefaultPageSize: A4
+*PageSize A4/A4: "<</PageSize[595.276 841.89]/ImagingBBox null>>setpagedevice"
+*PageSize Letter/Letter: "<</PageSize[612 792]/ImagingBBox null>>setpagedevice"
+*PageSize A3/A3: "<</PageSize[841.89 1190.55]/ImagingBBox null>>setpagedevice"
+*PageSize ISOB5/ISOB5: "<</PageSize[498.898 708.661]/ImagingBBox null>>setpagedevice"
+*PageSize Legal/Legal: "<</PageSize[612 1008]/ImagingBBox null>>setpagedevice"
+*CloseUI: *PageSize
+*OpenUI *PageRegion/纸张区域: PickOne
+*OrderDependency: 10 AnySetup *PageRegion
+*DefaultPageRegion: A4
+*PageRegion A4/A4: "<</PageSize[595.276 841.89]/ImagingBBox null>>setpagedevice"
+*PageRegion Letter/Letter: "<</PageSize[612 792]/ImagingBBox null>>setpagedevice"
+*PageRegion A3/A3: "<</PageSize[841.89 1190.55]/ImagingBBox null>>setpagedevice"
+*PageRegion ISOB5/ISOB5: "<</PageSize[498.898 708.661]/ImagingBBox null>>setpagedevice"
+*PageRegion Legal/Legal: "<</PageSize[612 1008]/ImagingBBox null>>setpagedevice"
+*CloseUI: *PageRegion
+*DefaultImageableArea: A4
+*ImageableArea A4/A4: "12.7 12.7 582.576 829.19"
+*ImageableArea Letter/Letter: "12.7 12.7 599.3 779.3"
+*ImageableArea A3/A3: "12.7 12.7 829.19 1177.85"
+*ImageableArea ISOB5/ISOB5: "12.7 12.7 486.198 695.961"
+*ImageableArea Legal/Legal: "12.7 12.7 599.3 995.3"
+*DefaultPaperDimension: A4
+*PaperDimension A4/A4: "595.276 841.89"
+*PaperDimension Letter/Letter: "612 792"
+*PaperDimension A3/A3: "841.89 1190.55"
+*PaperDimension ISOB5/ISOB5: "498.898 708.661"
+*PaperDimension Legal/Legal: "612 1008"
+*OpenUI *Resolution/分辨率: PickOne
+*OrderDependency: 10 AnySetup *Resolution
+*DefaultResolution: 300dpi
+*Resolution 300dpi/300 DPI: "<</HWResolution[300 300]>>setpagedevice"
+*Resolution 600dpi/600 DPI: "<</HWResolution[600 600]>>setpagedevice"
+*CloseUI: *Resolution
+*OpenUI *Duplex/双面打印: PickOne
+*OrderDependency: 30 AnySetup *Duplex
+*DefaultDuplex: None
+*Duplex None/单面（不翻转）: "<</Duplex false>>setpagedevice"
+*Duplex DuplexNoTumble/双面 · 长边翻转（像书本）: "<</Duplex true /Tumble false>>setpagedevice"
+*Duplex DuplexTumble/双面 · 短边翻转（像便签）: "<</Duplex true /Tumble true>>setpagedevice"
+*CloseUI: *Duplex
+*% 关键：声明本设备直接接受 PDF，直通滤镜（命令 `-`，cost 0）。
+*% -- 这一条保证 PDF 原样到达 backend --------------------------------------
+*cupsFilter2: "application/pdf application/vnd.cups-pdf 0 -"
+*cupsFilter2: "application/vnd.cups-pdf application/vnd.cups-pdf 0 -"
+*% 让文本/图片也能用：CUPS 先用 cgtexttopdf / cgimagetopdf 转成 PDF，
+*% 再走上面的直通分支。这样 `lp -d 南科大云打印 说明.txt` 也能工作。
+*cupsFilter2: "text/plain application/pdf 33 cgtexttopdf"
+*cupsFilter2: "application/x-shell application/pdf 33 cgtexttopdf"
+*cupsFilter2: "application/x-cshell application/pdf 33 cgtexttopdf"
+*cupsFilter2: "application/x-csource application/pdf 33 cgtexttopdf"
+*cupsFilter2: "application/x-perl application/pdf 33 cgtexttopdf"
+*cupsFilter2: "image/* application/pdf 25 cgimagetopdf"
+*cupsFilter2: "application/vnd.cups-banner application/pdf 33 cgbannertopdf"
+*cupsFilter2: "application/vnd.cups-command application/vnd.cups-command 0 commandtops"
+*End of File

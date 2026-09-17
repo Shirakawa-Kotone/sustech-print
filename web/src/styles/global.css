@@ -1,0 +1,572 @@
+/* ==========================================================================
+   南科大云打印 —— 应用外壳样式
+   Naive UI 负责组件，这里只负责布局、背景氛围和少量自定义块。
+   ========================================================================== */
+
+:root {
+  --shell-sidebar-w: 246px;
+  --shell-header-h: 62px;
+  --brand: #2f5bff;
+  --brand-2: #6f4bff;
+
+  /*
+   * 自己的一套表面色板。
+   *
+   * 千万别用 Naive UI 的 --n-color / --n-border-color：那些变量只挂在组件
+   * 自己的根元素上，:root 上是空的。写成 var(--surface) 看着有兜底，
+   * 实际上永远取到 #fff —— 深色模式下整片面板就是白的（实测 :root 的
+   * --n-color 求值为空字符串）。
+   *
+   * 这里改成由 html[data-theme] 驱动，App.vue 里根据实际主题写这个属性。
+   */
+  color-scheme: light;
+
+  --surface: #ffffff;
+  --surface-sunken: #f4f6fa;
+  --surface-inset: #fbfcfe;
+  --line: #e4e7ee;
+  --line-soft: #eceff5;
+  --line-strong: #d6dbe6;
+  --hover: rgba(47, 91, 255, 0.06);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+
+  --surface: #161a23;
+  --surface-sunken: #0d1017;
+  --surface-inset: #1a1f29;
+  --line: #242a36;
+  --line-soft: #212734;
+  --line-strong: #333c4a;
+  --hover: rgba(108, 140, 255, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+/*
+ * Naive UI 的 NConfigProvider 会渲染一层 .n-config-provider 的 div。
+ * 它的高度是 auto，于是里面 .shell 的 height:100% 会解析失败退化成内容高度，
+ * 结果窗口底部露出一条没有任何内容的 body 背景（深色模式下就是一条黑边）。
+ * 两处一起修：把中间层撑满，同时给 .shell 一个不依赖父级的 100vh 兜底。
+ */
+#app > .n-config-provider {
+  height: 100%;
+}
+
+body {
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 桌面端拖拽区：Electron 下标题栏可由 CSS 拖动 */
+.drag-region {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* ------------------------------------------------------------ 滚动条 --- */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+  background-color: rgba(120, 132, 152, 0.45);
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(120, 132, 152, 0.7);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* -------------------------------------------------------------- 外壳 --- */
+
+.shell {
+  display: grid;
+  grid-template-columns: var(--shell-sidebar-w) 1fr;
+  /* 用 100vh 而不是 100%：不依赖祖先元素的高度链，窗口怎么变都铺满 */
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ------------------------------------------------------------ 侧边栏 --- */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--line);
+  background:
+    radial-gradient(1200px 300px at -20% -10%, rgba(47, 91, 255, 0.1), transparent 60%),
+    var(--surface);
+}
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 18px 16px 14px;
+}
+
+/*
+ * macOS 的 hiddenInset 标题栏下，红绿灯按钮浮在网页上方，位置大约在
+ * x < 92、y < 34 的一块区域。实测侧边栏的品牌图标原本落在 (16, 18)，
+ * 正好被压住。这里把整块顶部让出来，并把这条空白做成可拖拽区，
+ * 顺带符合 macOS「左上角可以拖动窗口」的习惯。
+ */
+html[data-platform="darwin"] .sidebar-brand {
+  padding-top: 46px;
+}
+html[data-platform="darwin"] .sidebar::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--shell-sidebar-w);
+  height: 44px;
+  -webkit-app-region: drag;
+}
+.sidebar {
+  position: relative;
+}
+
+.brand-tile {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  border-radius: 11px;
+  color: #fff;
+  font-size: 19px;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--brand), var(--brand-2));
+  box-shadow: 0 6px 16px rgba(47, 91, 255, 0.32);
+}
+
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.brand-title {
+  font-size: 14.5px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  line-height: 1.25;
+}
+.brand-sub {
+  font-size: 11.5px;
+  opacity: 0.55;
+  line-height: 1.3;
+}
+
+.sidebar-nav {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 10px 10px;
+}
+
+.nav-group-label {
+  padding: 12px 10px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  opacity: 0.42;
+}
+
+.sidebar-foot {
+  padding: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.user-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  cursor: pointer;
+  text-align: left;
+  background: transparent;
+  color: inherit;
+  transition: background 0.16s ease, border-color 0.16s ease;
+}
+.user-chip:hover {
+  background: var(--hover);
+  border-color: var(--line);
+}
+.user-chip .avatar {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 650;
+  color: #fff;
+  background: linear-gradient(135deg, #4a70ff, #7b5cff);
+}
+.user-chip .who {
+  min-width: 0;
+  line-height: 1.3;
+}
+.user-chip .who b {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-chip .who span {
+  font-size: 11.5px;
+  opacity: 0.55;
+}
+
+/* --------------------------------------------------------------- 主区 --- */
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: var(--shell-header-h);
+  flex: 0 0 var(--shell-header-h);
+  padding: 0 22px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  backdrop-filter: saturate(180%) blur(14px);
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+.topbar .sub {
+  font-size: 12.5px;
+  opacity: 0.55;
+  margin-top: 1px;
+}
+.spacer {
+  flex: 1 1 auto;
+}
+
+.content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px 22px 40px;
+  background:
+    radial-gradient(900px 380px at 100% 0%, rgba(111, 75, 255, 0.07), transparent 55%),
+    transparent;
+}
+
+.content-inner {
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+/* --------------------------------------------------------------- 卡片 --- */
+
+.panel {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 15px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.panel-head h2 {
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 620;
+}
+.panel-body {
+  padding: 16px 18px;
+}
+
+/* 指标卡 */
+.metric {
+  padding: 16px 18px;
+}
+.metric .label {
+  font-size: 12.5px;
+  opacity: 0.58;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.metric .value {
+  margin-top: 7px;
+  font-size: 26px;
+  font-weight: 680;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.metric .value small {
+  font-size: 13px;
+  font-weight: 500;
+  opacity: 0.5;
+  margin-left: 3px;
+}
+.metric .hint {
+  margin-top: 5px;
+  font-size: 12px;
+  opacity: 0.5;
+}
+
+/* 补贴进度环容器 */
+.ring-wrap {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+}
+.ring-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1.15;
+}
+.ring-center .big {
+  font-size: 25px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.ring-center .cap {
+  font-size: 11.5px;
+  opacity: 0.55;
+  margin-top: 3px;
+}
+
+/* 下拉上传区 */
+.dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 34px 22px;
+  border: 1.5px dashed var(--line-strong);
+  border-radius: 14px;
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 0.16s ease, background 0.16s ease, transform 0.16s ease;
+}
+.dropzone:hover,
+.dropzone.over {
+  border-color: var(--brand);
+  background: rgba(47, 91, 255, 0.045);
+}
+.dropzone.over {
+  transform: scale(1.004);
+}
+.dropzone .big-icon {
+  font-size: 34px;
+  color: var(--brand);
+  opacity: 0.85;
+}
+.dropzone .dz-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+.dropzone .dz-sub {
+  font-size: 12.5px;
+  opacity: 0.55;
+}
+
+/* 上传队列项 */
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 4px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.queue-item:last-child {
+  border-bottom: none;
+}
+.queue-item .meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.queue-item .name {
+  font-size: 13.5px;
+  font-weight: 550;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queue-item .sub {
+  font-size: 11.5px;
+  opacity: 0.55;
+  margin-top: 1px;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.doc-name {
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 网格 */
+.grid {
+  display: grid;
+  gap: 14px;
+}
+.grid.cols-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.grid.cols-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.grid.cols-4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+@media (max-width: 1080px) {
+  .grid.cols-4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .grid.cols-3,
+  .grid.cols-2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* 登录页 */
+.login-bg {
+  display: grid;
+  place-items: center;
+  height: 100vh;
+  padding: 24px;
+  background:
+    radial-gradient(760px 420px at 12% 8%, rgba(47, 91, 255, 0.16), transparent 62%),
+    radial-gradient(680px 400px at 88% 92%, rgba(111, 75, 255, 0.16), transparent 60%),
+    var(--surface);
+}
+.login-card {
+  width: 100%;
+  max-width: 392px;
+  padding: 30px 30px 26px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--surface);
+  box-shadow: 0 24px 60px rgba(16, 24, 40, 0.14);
+}
+.login-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 22px;
+}
+.login-brand .brand-tile {
+  width: 52px;
+  height: 52px;
+  flex-basis: 52px;
+  border-radius: 15px;
+  font-size: 26px;
+}
+.login-brand h1 {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 680;
+}
+.login-brand p {
+  margin: 0;
+  font-size: 12.5px;
+  opacity: 0.55;
+  text-align: center;
+  line-height: 1.6;
+}
+
+/* 打印机状态点 */
+.status-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+.status-ok .status-dot {
+  background: #12a06a;
+  box-shadow: 0 0 0 3px rgba(18, 160, 106, 0.16);
+}
+.status-warn .status-dot {
+  background: #d99414;
+  box-shadow: 0 0 0 3px rgba(217, 148, 20, 0.16);
+}
+.status-danger .status-dot {
+  background: #d63b4a;
+  box-shadow: 0 0 0 3px rgba(214, 59, 74, 0.16);
+}
+.status-muted .status-dot {
+  background: #98a2b4;
+  box-shadow: 0 0 0 3px rgba(152, 162, 180, 0.16);
+}
+
+/* 过渡 */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+.fade-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.fade-leave-to {
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

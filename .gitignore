@@ -1,0 +1,33 @@
+# ---- 依赖 ----
+node_modules/
+
+# ---- 构建产物 ----
+dist-app/
+web/dist/
+
+# ---- 运行时状态 ----
+# .data/ 里有会话 Cookie（等于登录态），绝不能提交
+.data/
+*.log
+
+# ---- 参考材料 / 逆向产物 ----
+# reverse/ 是解包学校原版安装程序得到的产物，UniOpmClient_Setup.exe 是原版安装包本身，
+# screens/ 是逆向期的截图。都属于体积大、非源码的参考资料，不入库。
+reverse/
+UniOpmClient_Setup.exe
+screens/
+
+# ---- 测试临时目录 ----
+driver/macos/test/.work/
+
+# ---- 不入库的本地笔记 ----
+# 上游接口清单与字段语义（学校系统的内部细节）。文件留在本地，只是不提交。
+docs/upstream-api.md
+
+# ---- 系统 / 编辑器 ----
+.DS_Store
+._*
+Thumbs.db
+*.swp
+.idea/
+.vscode/

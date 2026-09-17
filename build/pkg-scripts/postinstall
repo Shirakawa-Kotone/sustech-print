@@ -1,0 +1,75 @@
+#!/bin/sh
+#
+# macOS .pkg 的 postinstall —— 由 Installer 以 root 身份执行。
+#
+# 干的事和 Windows 安装包里的 customInstall 对齐：App 装好之后，顺手把 CUPS
+# 虚拟打印机也装上。用户拿到的应该是一台能直接用的打印机，而不是"装完还得
+# 翻 README 手动 sudo 跑一个脚本"。
+#
+# 为什么这件事只有 pkg 能做：dmg 只是挂载一个磁盘映像，没有任何"安装时以
+# root 执行"的钩子；pkg 的 postinstall 才是那个钩子。
+#
+# 失败不返回非 0：驱动没装上不该让整个 App 安装回滚 —— 手动补救的命令会
+# 打印出来，README 里也有。
+set -u
+
+say() { printf '%s\n' "$*"; }
+
+# 找驱动脚本，不拼路径（App 名带中文）。
+#
+# 优先用 $3 —— Installer 传给脚本的"目标宗卷"。配合 pkg.isRelocatable=false，
+# App 会老实装到 <宗卷>/Applications。再去 /Applications 兜一次，
+# 以防有人改了 installLocation。
+TARGET_VOL="${3:-/}"
+APPS_DIR="${TARGET_VOL%/}/Applications"
+[ -d "$APPS_DIR" ] || APPS_DIR="/Applications"
+
+INSTALL_SH="$(/usr/bin/find "$APPS_DIR" -maxdepth 8 \
+    -path '*/Contents/Resources/driver/macos/install.sh' -print -quit 2>/dev/null || true)"
+if [ -z "$INSTALL_SH" ] && [ "$APPS_DIR" != "/Applications" ]; then
+    INSTALL_SH="$(/usr/bin/find /Applications -maxdepth 8 \
+        -path '*/Contents/Resources/driver/macos/install.sh' -print -quit 2>/dev/null || true)"
+fi
+
+if [ -z "$INSTALL_SH" ]; then
+    say "[南科大云打印] 没找到驱动安装脚本，跳过打印机安装。"
+    say "  在 $APPS_DIR 下没找到 <App>.app/Contents/Resources/driver/macos/install.sh"
+    say "  手动补救： sudo sh <App>.app/Contents/Resources/driver/macos/install.sh"
+    exit 0
+fi
+
+# spool 目录（/var/spool/sustech-print）要归"真正用这台机器的人"，
+# 不能给 root —— 否则 App 以普通用户身份跑起来读写不了，打印作业取不走。
+#
+# pkg 脚本里没有 SUDO_USER（Installer 直接以 root 跑），所以用控制台当前用户。
+CONSOLE_USER="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)"
+case "$CONSOLE_USER" in
+    ""|root|_mbsetupuser)
+        # 没有图形登录会话（例如远程装）时，退回第一个真实用户
+        CONSOLE_USER="$(/usr/bin/dscl . -list /Users NFSHomeDirectory 2>/dev/null \
+            | /usr/bin/awk '$2 ~ /^\/Users\// {print $1; exit}')"
+        ;;
+esac
+
+say "[南科大云打印] 正在安装虚拟打印机 ..."
+say "  驱动脚本 : $INSTALL_SH"
+say "  spool 属主: ${CONSOLE_USER:-root}"
+
+status=0
+if [ -n "${CONSOLE_USER:-}" ] && [ "$CONSOLE_USER" != "root" ]; then
+    SUSTECH_SPOOL_OWNER="$CONSOLE_USER" /bin/sh "$INSTALL_SH" || status=$?
+else
+    /bin/sh "$INSTALL_SH" || status=$?
+fi
+
+if [ "$status" -eq 0 ]; then
+    say "[南科大云打印] 虚拟打印机安装完成。"
+else
+    say ""
+    say "[南科大云打印] ！！虚拟打印机安装失败（退出码 $status）。"
+    say "  App 本身已经装好了，但打印功能暂时不可用。可以手动重试："
+    say "      sudo sh \"$INSTALL_SH\""
+    say ""
+fi
+
+exit 0

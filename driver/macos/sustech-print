@@ -1,0 +1,342 @@
+#!/bin/sh
+#
+# sustech-print —— 南科大云打印 macOS CUPS backend（落盘版）
+# ---------------------------------------------------------------------------
+# CUPS 调用约定：
+#     backend job-id user title copies options [filename]
+# 打印数据从 stdin 进来。CUPS 1.2+ 不传 filename，所以必须从 stdin 读。
+#
+# 本脚本**只做一件事**：把作业（PDF）原子地写进共享 spool 目录，然后退出。
+# 上传云端、登录、令牌全部由「南科大云打印」桌面 App 负责 ——
+# App 监听 spool 目录，看到新文件就取走并提交。
+#
+#   CUPS ──▶ backend ──写入──▶ /var/spool/sustech-print/incoming/xxx.pdf
+#                                        │
+#                                        ▼
+#                            桌面 App（spool 监听 + 上传）
+#
+# 为什么不让 backend 自己 POST 到本地 API（v1 曾经这么做，实测失败）：
+#
+#   1. **backend 的 HOME 不是用户家目录。** CUPS 给 backend 设的 HOME 是
+#      /var/spool/cups/tmp（实测 CUPS error_log：找不到
+#      `/private/var/spool/cups/tmp/Library/Application Support/SUSTechPrint/driver-token`）。
+#      所以任何靠 `$HOME/Library/Application Support/...` 定位令牌/端口的做法都是错的。
+#   2. **backend 不在用户的 GUI 会话里**，`open -a "南科大云打印"` 拉不起 App。
+#      （这正是原厂 Windows 客户端要折腾 winsta0\default + explorer.exe 的原因。）
+#   3. App 没运行时直接失败体验很差；落盘则作业会静静等着，App 一起来就自动提交。
+#
+# 退出码语义（cups backend(7)）：
+#   0 成功（已落盘）
+#   1 失败。**确定性失败一律用 1**：绝不再用 2 —— 实测退出码 2 会让 CUPS
+#     "Job held for authentication"，作业卡在队列里出不去。
+#
+# 本脚本运行在 cupsd 的子进程里，身份是 **root**（系统自带 backend 也是
+# -rwx------ root:wheel），但仍然：不假设 HOME、不写 stdout、不信任环境变量路径、
+# 所有变量加引号、只写 stderr 与 spool 日志。
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+
+# 共享 spool。根目录放日志，incoming 是 App 监听的落地目录。
+DEFAULT_SPOOL_ROOT="/var/spool/sustech-print"
+DEFAULT_SPOOL_DIR="$DEFAULT_SPOOL_ROOT/incoming"
+
+MAX_JOB_BYTES=104857600   # 100 MiB
+TITLE_MAX_CHARS=60        # 文件名里标题的最大字符数（按字符，不是字节）
+
+SELF="$(basename "$0")"
+
+# ---------------------------------------------------------------------------
+# 参数
+# ---------------------------------------------------------------------------
+
+JOB_ID="${1:-}"
+JOB_USER="${2:-}"
+JOB_TITLE="${3:-}"
+JOB_COPIES="${4:-1}"
+JOB_OPTIONS="${5:-}"
+JOB_FILE_ARG="${6:-}"   # CUPS 1.2+ 不传；少数老式调用会传
+
+# 只保留日志安全的字符，防止日志注入
+JOB_ID="$(printf '%s' "$JOB_ID" | tr -cd '[:alnum:]_.-' | cut -c1-32)"
+JOB_USER="$(printf '%s' "$JOB_USER" | tr -cd '[:alnum:]_.@- ' | cut -c1-64)"
+JOB_TITLE_LOG="$(printf '%s' "$JOB_TITLE" | LC_ALL=C tr -d '\000-\037\177' | cut -c1-120)"
+
+DEVICE_URI="${DEVICE_URI:-}"
+
+# 明确抹掉来自环境的 CUPS_* 路径变量：CUPS 会把它们一并传给 backend，
+# 而本脚本以 root 运行，不能让外部输入决定去执行哪里的程序。
+CUPS_SERVERBIN=""
+CUPS_SERVERROOT=""
+CUPS_DATADIR=""
+CUPS_BACKEND=""
+export CUPS_SERVERBIN CUPS_SERVERROOT CUPS_DATADIR CUPS_BACKEND
+
+# ---------------------------------------------------------------------------
+# spool 目录与日志
+# ---------------------------------------------------------------------------
+#
+# 目录优先用 SUSTECH_SPOOL_DIR（安装脚本 / 测试会设），否则用固定的系统路径。
+# **注意：这里不读 HOME。** backend 的 HOME 是 /var/spool/cups/tmp，读了也没用。
+
+SPOOL_DIR="${SUSTECH_SPOOL_DIR:-$DEFAULT_SPOOL_DIR}"
+
+# 日志放 spool 根目录（即 incoming 的上一级）；如果 incoming 被覆盖成别的名字，
+# 就退化成写在它的上一级目录。
+case "$SPOOL_DIR" in
+    */incoming) SPOOL_ROOT="${SPOOL_DIR%/incoming}" ;;
+    *)          SPOOL_ROOT="$(dirname "$SPOOL_DIR")" ;;
+esac
+[ -n "$SPOOL_ROOT" ] || SPOOL_ROOT="$DEFAULT_SPOOL_ROOT"
+LOG_FILE="${SUSTECH_DRIVER_LOG:-$SPOOL_ROOT/driver.log}"
+
+# CUPS 把 backend 的 umask 设成 0077。于是 root 第一次创建 driver.log 会得到 0600，
+# 而 install.sh 恰恰让用户"出问题看 driver.log" —— 用户根本读不了（实测踩到）。
+# 这里显式放宽到 0644：内容只有作业元信息（标题/大小/结果），不含任何凭据；
+# 而且父目录是 0750，本来就只有属主和 staff 组能进来。
+# 写在任何一次日志写入之前，保证用户读到的日志从一开始就是可读的。
+if [ ! -e "$LOG_FILE" ]; then
+    : >>"$LOG_FILE" 2>/dev/null || true
+fi
+chmod 0644 "$LOG_FILE" 2>/dev/null || true
+
+log() {
+    _lvl="$1"
+    shift
+    _line="$(date -u '+%Y-%m-%dT%H:%M:%SZ') [$SELF] [$_lvl] job=${JOB_ID:-?} user=${JOB_USER:-?} $*"
+    printf '%s\n' "$_line" >&2
+    # 日志写不进去（权限等）不算致命：CUPS 的 error_log 里仍有 stderr 版本
+    if [ -d "$SPOOL_ROOT" ]; then
+        printf '%s\n' "$_line" >>"$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+die() {
+    _code="$1"
+    shift
+    log ERROR "$*"
+    exit "$_code"
+}
+
+# ---------------------------------------------------------------------------
+# 前置检查
+# ---------------------------------------------------------------------------
+
+if [ ! -d "$SPOOL_DIR" ]; then
+    die 1 "spool 目录不存在：${SPOOL_DIR}（请重新运行 sudo ./install.sh 创建）"
+fi
+if [ ! -w "$SPOOL_DIR" ]; then
+    die 1 "spool 目录不可写：${SPOOL_DIR}（属主/权限不对，请重新运行 sudo ./install.sh）"
+fi
+
+log INFO "开始接收作业 title='$JOB_TITLE_LOG' copies=$JOB_COPIES dev='$DEVICE_URI' spool=$SPOOL_DIR"
+
+# ---------------------------------------------------------------------------
+# 把作业从 stdin 流式落到**暂存区**（不占内存，也绝不让 App 看到半个文件）
+# ---------------------------------------------------------------------------
+#
+# 暂存文件写在 spool 根目录下的 .staging/ —— 那**不是** App 监听的目录，
+# 所以中途失败也不会被 App 捡走半个文件。成功后再 rename 进 incoming/。
+
+STAGING_DIR="$SPOOL_ROOT/.staging"
+if ! mkdir -p "$STAGING_DIR" 2>/dev/null; then
+    # 根目录不可写就退回 incoming 里用隐藏前缀（至少还是同文件系统、rename 原子）
+    STAGING_DIR="$SPOOL_DIR"
+    log WARN "无法创建 $SPOOL_ROOT/.staging，暂存文件将写在 $SPOOL_DIR 下"
+fi
+
+TMP_FILE=""
+cleanup() {
+    [ -n "$TMP_FILE" ] && [ -e "$TMP_FILE" ] && rm -f "$TMP_FILE"
+    return 0
+}
+trap 'cleanup' EXIT
+trap 'cleanup; exit 1' HUP INT QUIT TERM
+
+TMP_FILE="$(mktemp "$STAGING_DIR/.sustech-print.XXXXXX" 2>/dev/null)" || TMP_FILE=""
+if [ -z "$TMP_FILE" ]; then
+    TMP_FILE="$STAGING_DIR/.sustech-print.$$"
+    (umask 077; : >"$TMP_FILE") 2>/dev/null \
+        || die 1 "无法在 $STAGING_DIR 创建暂存文件"
+fi
+# 先私有，落定前再放开读权限
+chmod 0600 "$TMP_FILE" 2>/dev/null || true
+
+if [ -n "$JOB_FILE_ARG" ] && [ -f "$JOB_FILE_ARG" ]; then
+    cat -- "$JOB_FILE_ARG" >"$TMP_FILE" 2>/dev/null \
+        || die 1 "无法读取作业文件参数 $JOB_FILE_ARG"
+else
+    cat >"$TMP_FILE" 2>/dev/null
+    _rc=$?
+    [ "$_rc" -eq 0 ] || die 1 "读取 stdin 打印数据失败（cat 退出码 ${_rc}）"
+fi
+
+JOB_BYTES="$(wc -c <"$TMP_FILE" 2>/dev/null | tr -d '[:space:]')"
+case "$JOB_BYTES" in
+    ''|*[!0-9]*) JOB_BYTES=0 ;;
+esac
+
+[ "$JOB_BYTES" -gt 0 ] || die 1 "作业为空（0 字节），没有可写入的内容"
+[ "$JOB_BYTES" -le "$MAX_JOB_BYTES" ] \
+    || die 1 "作业过大（$JOB_BYTES 字节 > 上限 ${MAX_JOB_BYTES}）"
+
+log INFO "已接收 $JOB_BYTES 字节"
+
+# ---------------------------------------------------------------------------
+# 魔数判定：只接受 PDF
+# ---------------------------------------------------------------------------
+
+FORMAT=""
+MAGIC5="$(head -c 5 "$TMP_FILE" 2>/dev/null)"
+MAGIC2="$(head -c 2 "$TMP_FILE" 2>/dev/null)"
+case "$MAGIC5" in
+    '%PDF-') FORMAT="pdf" ;;
+esac
+if [ -z "$FORMAT" ]; then
+    case "$MAGIC2" in
+        '%!') FORMAT="ps" ;;
+    esac
+fi
+if [ -z "$FORMAT" ]; then
+    case "$(head -c 64 "$TMP_FILE" 2>/dev/null | LC_ALL=C tr -d '\000\r\n\t ' | cut -c1-4)" in
+        '%!PS') FORMAT="ps" ;;
+    esac
+fi
+
+ps_to_pdf() {
+    # 只有本机碰巧装了 Ghostscript 系工具时才可能成功。
+    # 这不是"依赖 Ghostscript"：没有就明确失败（见下面的分支）。
+    _in="$1"
+    _out="$1.conv"
+    _p=""
+
+    for _c in ps2pdf ps2pdfwr gs; do
+        _p="$(command -v "$_c" 2>/dev/null)" || _p=""
+        [ -n "$_p" ] || continue
+        case "$_c" in
+            gs)
+                if "$_p" -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=pdfwrite \
+                        -dCompatibilityLevel=1.4 "-sOutputFile=$_out" "$_in" \
+                        >/dev/null 2>&1 && [ -s "$_out" ]; then
+                    mv -f "$_out" "$_in" && return 0
+                fi
+                ;;
+            *)
+                if "$_p" -q -dNOPAUSE -dBATCH -dSAFER "-sOutputFile=$_out" "$_in" \
+                        >/dev/null 2>&1 && [ -s "$_out" ]; then
+                    mv -f "$_out" "$_in" && return 0
+                fi
+                ;;
+        esac
+    done
+
+    _p="$(command -v pstopdf 2>/dev/null)" || _p=""
+    if [ -n "$_p" ]; then
+        if "$_p" "$_in" -o "$_out" >/dev/null 2>&1 && [ -s "$_out" ]; then
+            mv -f "$_out" "$_in" && return 0
+        fi
+    fi
+
+    _p="$(command -v mutool 2>/dev/null)" || _p=""
+    if [ -n "$_p" ]; then
+        if "$_p" convert -o "$_out" "$_in" >/dev/null 2>&1 && [ -s "$_out" ]; then
+            mv -f "$_out" "$_in" && return 0
+        fi
+    fi
+
+    rm -f "$_out" 2>/dev/null
+    return 1
+}
+
+case "$FORMAT" in
+    pdf)
+        log INFO "格式判定：PDF"
+        ;;
+    ps)
+        # 有转换器就转；没有就明确失败 —— 绝不把 PostScript 当 .pdf 写进 spool，
+        # 那等于让 App 去上传一个坏文件。
+        if ps_to_pdf "$TMP_FILE"; then
+            FORMAT="pdf"
+            JOB_BYTES="$(wc -c <"$TMP_FILE" 2>/dev/null | tr -d '[:space:]')"
+            case "$JOB_BYTES" in ''|*[!0-9]*) JOB_BYTES=0 ;; esac
+            log INFO "PostScript 已转换为 PDF（$JOB_BYTES 字节）"
+        else
+            die 1 "收到 PostScript，但本机没有 PS→PDF 转换器（gs/ps2pdf/pstopdf/mutool 均不存在），拒绝写出坏文件"
+        fi
+        ;;
+    *)
+        die 1 "不支持的输入格式（魔数既不是 %PDF 也不是 %!），前 2 字节=[$MAGIC2]"
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# 文档名：<epoch-ms>-<jobid>-<清理过的title>.pdf
+# ---------------------------------------------------------------------------
+
+sanitize_name() {
+    # 去掉控制字符与路径危险字符；中文原样保留。
+    printf '%s' "$1" \
+        | LC_ALL=C tr -d '\000-\037\177' \
+        | sed -e 's|[/\\:*?"<>|]|_|g' \
+        | sed -e 's/^[. ]*//' -e 's/[[:space:]]\{1,\}/ /g' -e 's/[. ]*$//' \
+        | cut -c1-$TITLE_MAX_CHARS
+}
+
+TITLE_CLEAN="$(sanitize_name "$JOB_TITLE")"
+# 标题里可能已经带了 .pdf（`lp -d 队列 文件.pdf` 时 CUPS 就把作业名设成 "文件.pdf"），
+# 而 DEST 后面还会再补一个 .pdf。不剥掉的话用户会在云打印队列里看到
+# "...-sample-zh.pdf.pdf"（实测踩到）。
+case "$TITLE_CLEAN" in
+    *.[Pp][Dd][Ff]) TITLE_CLEAN="${TITLE_CLEAN%.*}" ;;
+esac
+[ -n "$TITLE_CLEAN" ] || TITLE_CLEAN="云打印"
+
+# epoch 毫秒：macOS 的 date 支持 %N（纳秒），取前 13 位即毫秒。
+MS="$(date +%s%N 2>/dev/null | cut -c1-13)"
+case "$MS" in
+    ''|*[!0-9]*) MS="$(date +%s)" ;;
+esac
+
+BASE_NAME="${MS}-${JOB_ID:-0}-${TITLE_CLEAN}"
+
+# ---------------------------------------------------------------------------
+# 原子落定：同文件系统内 rename，App 永远看不到半个文件
+# ---------------------------------------------------------------------------
+
+DEST="$SPOOL_DIR/$BASE_NAME.pdf"
+N=0
+while [ -e "$DEST" ]; do
+    N=$((N + 1))
+    [ "$N" -le 100 ] || die 1 "无法生成唯一文件名（$SPOOL_DIR 下重名过多）"
+    DEST="$SPOOL_DIR/$BASE_NAME-$N.pdf"
+done
+
+chmod 0644 "$TMP_FILE" 2>/dev/null || true
+
+# 文件属主给打印用户，这样 App（同一用户）能读写、也能把它移动到 done/failed。
+# 拿不到 uid 就算了；root 属主 + 0644 至少 App 能读走。
+if [ -n "$JOB_USER" ]; then
+    _uid="$(id -u "$JOB_USER" 2>/dev/null)" || _uid=""
+    _gid="$(id -g "$JOB_USER" 2>/dev/null)" || _gid=""
+    if [ -n "$_uid" ] && [ -n "$_gid" ]; then
+        chown "$_uid:$_gid" "$TMP_FILE" 2>/dev/null || true
+    fi
+fi
+
+if ! mv -f -- "$TMP_FILE" "$DEST" 2>/dev/null; then
+    die 1 "无法把作业移动到 $DEST"
+fi
+TMP_FILE=""   # 已改名成功，不需要清理
+
+if [ ! -s "$DEST" ]; then
+    rm -f "$DEST" 2>/dev/null
+    die 1 "落盘后文件为空：$DEST"
+fi
+
+FINAL_BYTES="$(wc -c <"$DEST" 2>/dev/null | tr -d '[:space:]')"
+case "$FINAL_BYTES" in ''|*[!0-9]*) FINAL_BYTES="$JOB_BYTES" ;; esac
+
+log INFO "结果 exit=0 bytes=$FINAL_BYTES format=$FORMAT copies=$JOB_COPIES options='$JOB_OPTIONS' title='$JOB_TITLE_LOG' file='$(basename "$DEST")' 已落盘"
+
+exit 0
