@@ -31,7 +31,8 @@
     - cmd 会**等**worker 结束，所以不存在"任务结束了子进程被一起干掉"的问题。
 
 .PARAMETER Action
-    install 或 uninstall。
+    install 或 uninstall。只跑 -SelfTest 时可以省略 —— 早期版本把它标成必填，
+    结果 `install-wake.ps1 -SelfTest` 会卡在交互式补参提示上（非交互会话里直接报错）。
 
 .PARAMETER AppExe
     客户端可执行文件。默认按"本脚本所在位置往上三层就是安装目录"来推断
@@ -73,9 +74,8 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
     [ValidateSet('install', 'uninstall')]
-    [string] $Action,
+    [string] $Action = '',
 
     [string] $AppExe   = '',
     [string] $SpoolDir = (Join-Path $env:ProgramData 'SUSTechPrint\spool'),
@@ -456,4 +456,10 @@ function Invoke-SelfTest {
 
 if ($SelfTest) { exit (Invoke-SelfTest) }
 if ($Action -eq 'install') { exit (Invoke-Install) }
-exit (Invoke-Uninstall)
+if ($Action -eq 'uninstall') { exit (Invoke-Uninstall) }
+
+Write-Host ''
+Write-Host '  用法：install-wake.ps1 -Action install|uninstall [-LogonType Auto|S4U|Interactive]' -ForegroundColor Yellow
+Write-Host '        install-wake.ps1 -SelfTest        （只校验任务定义，不碰系统）' -ForegroundColor Yellow
+Write-Host ''
+exit 2
