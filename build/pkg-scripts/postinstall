@@ -73,3 +73,37 @@ else
 fi
 
 exit 0
+
+# ---------------------------------------------------------------------------
+# 装完把客户端拉起来，让用户完成第一次登录
+# ---------------------------------------------------------------------------
+#
+# 为什么必须做这一步：登录态是云打印服务端的会话 cookie，没有 expires，
+# 空闲就会被服务端丢掉。客户端现在**不常驻**（关窗口空闲一会儿就整个退出），
+# 打印时由系统唤醒一个无头进程去上传 —— 那个进程不跑 Electron，读不到
+# safeStorage 写的老格式凭据，只能靠 App 启动时把它迁到钥匙串/DPAPI 里。
+#
+# 所以"装完从没打开过 App"就等于"打印了什么都不会发生"。安装包里带一次自动
+# 启动，把"登录 + 迁移"这两件事在用户第一次打印之前就办掉。
+#
+# 两个细节：
+#   - 必须用 `launchctl asuser <uid>` 在**用户的图形会话**里 open。postinstall
+#     是 root，直接 open 的话 App 会起在 root 的上下文里（配置文件写到 root 家目录）。
+#   - `open -g` 不抢焦点，别把用户正在干的事打断。失败只是没自动打开，不影响别的。
+APP_PATH="${APPS_DIR}/南科大云打印.app"
+if [ -d "$APP_PATH" ]; then
+    CONSOLE_UID="$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)"
+    if [ -n "${CONSOLE_UID:-}" ] && [ "$CONSOLE_UID" != "0" ]; then
+        say "[南科大云打印] 正在打开客户端，请完成登录 ..."
+        /bin/launchctl asuser "$CONSOLE_UID" \
+            /usr/bin/sudo -u "$CONSOLE_USER" \
+            /usr/bin/open -g "$APP_PATH" 2>/dev/null \
+            || say "[南科大云打印] 自动打开失败，请从「启动台 / 应用程序」手动打开一次并登录。"
+    else
+        say "[南科大云打印] 没有检测到图形登录会话，请手动打开客户端并登录一次。"
+    fi
+else
+    say "[南科大云打印] 没找到 $APP_PATH，请手动打开客户端并登录一次。"
+fi
+
+exit 0

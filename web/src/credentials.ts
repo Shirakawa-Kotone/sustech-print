@@ -1,8 +1,12 @@
 // 凭据存储。
 //
-// 只有桌面版（Electron）才有真正的"自动保存密码"：主进程用系统的
-// safeStorage —— macOS 落到「钥匙串」，Windows 落到「DPAPI（当前用户）」——
-// 加密后写到应用数据目录。密码不会以明文落盘，也不经过 localStorage。
+// 只有桌面版才有真正的"自动保存密码"：主进程把密码交给系统加密存储 ——
+// macOS 落到「钥匙串」，Windows 落到「DPAPI（当前用户）」。密码不会以明文落盘，
+// 也不经过 localStorage。
+//
+// 之所以不用 Electron 自带的 safeStorage：打印时被系统唤醒的那个无头进程不跑
+// Electron，拿不到它，却必须能自动重登（云打印的登录态是服务端会话 cookie，
+// 空闲一会儿就没了）。所以两边统一走 lib/secret.mjs。
 //
 // 纯浏览器里没有等价的、无需主密码的安全存储（localStorage 是明文的），
 // 所以那种情况下干脆不提供这个开关，而不是偷偷存明文。
@@ -35,9 +39,7 @@ interface DesktopBridge {
       serverUrl: string;
       configDir: string;
       logFile: string;
-      openAtLogin: boolean;
     }>;
-    setOpenAtLogin(enabled: boolean): Promise<{ ok: boolean; openAtLogin: boolean }>;
   };
 }
 

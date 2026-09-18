@@ -3,13 +3,30 @@
 // 职责：
 //   1. 在本进程内启动那个零依赖的 Node 服务（随机端口，只监听 127.0.0.1）
 //   2. 开一个窗口指向它——这就是"webview 套壳"，前端一行没改就跑在桌面里了
-//   3. 用系统钥匙串保存密码（safeStorage），并把凭据交给服务端做会话自动续期
+//   3. 用系统加密存储保存密码（lib/secret.mjs），并把凭据交给服务端做会话自动续期
 //   4. 盯着 spool 目录，把虚拟打印机落盘的 PDF 提交进队列
 //   5. 托盘常驻：关窗口不退出，否则驱动就没人接活了
+//
+// ── 内存是怎么省的（这是本文件现在最需要注意的部分）────────────────────────
+//
+// 之前这里是一套"关窗口只 hide、开机自启、托盘常驻"的写法，实测常驻 587 MB
+// （主进程 210 + 渲染 217 + GPU 108 + 工具 52）。现在改成**按需存在**：
+//
+//   - 窗口在关闭时 destroy 而不是 hide，渲染进程和 GPU 进程直接还给系统；
+//     下次从托盘/图标打开时重建。代价是重新打开要几百毫秒，换来的是 ~325 MB。
+//   - 把窗口收起来之后整段时间没有任何活动，就在 IDLE_EXIT_MS 之后**整个退出**，
+//     常驻变成 0。用户再次打开走图标，打印则走系统唤醒（见 desktop/worker.mjs）。
+//   - 所以「开机自动启动」这件事没有意义了，这里会把它关掉（含清掉老版本留下的
+//     登录项），不再提供这个开关。
+//
+// 打印链路在没有本进程时怎么活：macOS 由 LaunchAgent 的 WatchPaths、Windows 由
+// 计划任务把**无头工作进程**（worker.mjs，纯 node，54 MB，干完就退）叫起来。
+// 见 installLaunchAgent() 和 driver/windows/install-wake.ps1。
 
 import { mkdirSync } from "node:fs";
-import { access, appendFile, mkdir, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -22,14 +39,19 @@ import {
   shell,
 } from "electron";
 
-import { CONFIG_DIR, DRIVER_LOG_FILE, PRINTER_NAME, ensureDirs } from "../lib/paths.mjs";
+import {
+  CONFIG_DIR,
+  DRIVER_LOG_FILE,
+  PRINTER_NAME,
+  SYSTEM_SPOOL_DIR,
+  ensureDirs,
+} from "../lib/paths.mjs";
 import * as credentials from "./credentials.mjs";
 import { SpoolWatcher } from "./spool-watcher.mjs";
 
 // 让 Electron 的 userData 目录和驱动用的 CONFIG_DIR 保持一致，
-// 这样 credentials.bin（加密后的密码）和 driver-token 躺在一起，
-// 排查问题只看一个地方 —— 而且两者都在用户自己的 %LOCALAPPDATA% 下，
-// 不会出现"文件属于别人、自己改不动"的权限问题。
+// 这样 credentials 和 driver-token 躺在一起，排查问题只看一个地方 ——
+// 而且两者都在用户自己的 %LOCALAPPDATA% 下，不会出现"文件属于别人、自己改不动"。
 //
 // setPath 要求目录先存在，所以这里同步建出来（异步的 ensureDirs 在 whenReady 里）。
 app.setName("SUSTechPrint");
@@ -48,6 +70,25 @@ const ASSETS = join(__dirname, "assets");
  */
 const SHOT_MODE = Boolean(process.env.SUSTECH_SHOT);
 
+/**
+ * 关掉窗口之后，再空闲这么久就整个退出。
+ *
+ * 5 分钟是个折中：短于此，用户"关掉又马上打开"会反复冷启动；长于此，
+ * 那段"其实什么都没干"的常驻内存就白占着。开发/测试可以用
+ * SUSTECH_IDLE_EXIT_MS 覆盖（0 表示永远不自动退出）。
+ */
+const IDLE_EXIT_MS = Number(
+  process.env.SUSTECH_IDLE_EXIT_MS ?? 5 * 60_000,
+);
+/** 多久检查一次空闲。 */
+const IDLE_CHECK_MS = 10_000;
+
+/** 把空闲阈值说成人话（测试时经常设成几秒，别显示成 0.0833 分钟）。 */
+const IDLE_LABEL =
+  IDLE_EXIT_MS >= 60_000
+    ? `${Math.round(IDLE_EXIT_MS / 60_000)} 分钟`
+    : `${Math.round(IDLE_EXIT_MS / 1000)} 秒`;
+
 /** @type {BrowserWindow|null} */
 let win = null;
 /** @type {Tray|null} */
@@ -57,10 +98,14 @@ let watcher = null;
 let serverInfo = null;
 let driverToken = "";
 let quitting = false;
-/** 这次启动只驻留托盘、不显示窗口（开机自启拉起来的情形）。 */
-let startHidden = false;
 /** 供渲染进程读取的"驱动令牌"，只在主进程和服务端之间流转。 */
 let serverModule = null;
+/** 最后一次"有事发生"的时刻，空闲退出看的是它。 */
+let lastActivity = Date.now();
+
+function touch() {
+  lastActivity = Date.now();
+}
 
 /* ------------------------------------------------------------------ 日志 --- */
 
@@ -77,6 +122,15 @@ async function log(message, level = "info") {
   } catch {
     /* 日志写不进去不该影响主流程 */
   }
+}
+
+/** 跑一个命令，只关心成功与否。 */
+function run(cmd, args) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { stdio: "ignore" });
+    child.on("error", () => resolve(false));
+    child.on("close", (code) => resolve(code === 0));
+  });
 }
 
 /* ------------------------------------------------------------ 本地服务 --- */
@@ -108,103 +162,181 @@ async function bootServer() {
   return serverInfo;
 }
 
-/** 把已保存的凭据交给服务端，用于会话过期后自动重登。 */
+/**
+ * 把已保存的凭据交给服务端，用于会话过期后自动重登。
+ *
+ * 传的是**函数**而不是当场读出来的对象：读系统加密存储是有成本的
+ * （Windows 上要起一次 PowerShell），而会话还好好的时候根本用不着它。
+ * 服务端只在真的要重登时才调用它 —— 见 server.mjs 的 tryRelogin。
+ */
 async function armCredential() {
-  const saved = await credentials.load();
-  if (saved?.username && serverModule) {
-    serverModule.setRememberedCredential(saved);
-    await log(`已加载本机保存的凭据（${saved.username}），会话失效时会自动重登`);
-    return true;
-  }
-  if (serverModule) serverModule.setRememberedCredential(null);
-  return false;
+  if (!serverModule) return false;
+  serverModule.setRememberedCredential(async () => {
+    const saved = await credentials.load();
+    if (saved?.username) {
+      await log(`已加载本机保存的凭据（${saved.username}），会话失效时会自动重登`);
+    }
+    return saved;
+  });
+  return true;
 }
 
-/* -------------------------------------------------------------- 开机自启 --- */
+/* ------------------------------------------------- 开机自启（已废弃）------- */
 
 /**
- * 首次启动默认打开「开机自动启动」（仅 Windows、仅打包版）。
+ * 把老版本登记的「开机自动启动」清掉。
  *
- * 为什么需要这个默认值：虚拟打印机本质上只是一个"把作业写成 PDF"的端口，
- * PDF 得靠这个 App 去上传。App 没在跑，用户打印完就什么都不会发生。
- * Windows 安装包（build/installer.nsh）装完会把 App 拉起来一次，所以
- * 第一次运行时替用户把开关拨到 on 是合理的。
+ * 为什么要主动清：以前 App 必须常驻才能接住驱动的作业，所以默认开了自启；
+ * 现在打印由系统按需唤醒（worker.mjs），自启只会让用户登录后白白常驻一份
+ * 几百兆的 Electron。老用户升级上来时登录项还在，不清掉就等于没改。
  *
- * 只做一次：写完标记就再也不碰，之后完全交给托盘菜单里的勾选项 ——
- * 用户自己关掉之后，我们不会下次启动又给他打开。
- *
- * 两个刻意的限制：
- *   - 只在 Windows 上做。macOS 的登录项在「系统设置 → 通用 → 登录项」里
- *     很显眼，默认改它属于另一个决定，等需要时再说。
- *   - 只在打包版里做。开发时 `electron .` 跑起来的是 node_modules 里的
- *     electron.exe，给它注册自启是纯粹的污染。
+ * 只做一次。做完写个标记，之后再也不碰用户的登录项 —— 万一他真有别的用途，
+ * 我们不该每次启动都去关一遍。
  */
-const AUTOSTART_MARKER = join(CONFIG_DIR, "autostart-initialized");
-
-/**
- * 开机自启时附加的命令行标记：带了它就只驻留托盘，不弹窗口。
- *
- * 为什么需要自己造一个：macOS 的 setLoginItemSettings 有 openAsHidden，
- * Windows **没有**，传了会被静静忽略 —— 结果就是每次开机都往屏幕中间
- * 弹一个窗口。想在 Windows 上做到"开机后安静地起在托盘里"，只能往登录项
- * 的命令行里塞一个参数，启动时再认回来。
- */
-const HIDDEN_FLAG = "--hidden";
-
-function loginItemArgs() {
-  return process.platform === "win32" ? [HIDDEN_FLAG] : [];
-}
-
-/**
- * 读「开机自动启动」的当前状态。
- *
- * Windows 上 Electron 是拿注册表里的命令行跟 path + args 逐字比对的：
- * 不传 args 时它会用**当前进程**的命令行，于是"静默启动时勾选是开的、
- * 手动启动时又变成关的"。所以 get 和 set 必须传同一组 args。
- */
-function readOpenAtLogin() {
-  return process.platform === "win32"
-    ? app.getLoginItemSettings({ args: loginItemArgs() }).openAtLogin
-    : app.getLoginItemSettings().openAtLogin;
-}
-
-function writeOpenAtLogin(enabled) {
-  const options = { openAtLogin: Boolean(enabled), openAsHidden: true };
-  if (process.platform === "win32") options.args = loginItemArgs();
-  app.setLoginItemSettings(options);
-  return readOpenAtLogin();
-}
-
-/** 这次启动是不是登录项拉起来的 —— 是的话只进托盘，不显示窗口。 */
-function startedHidden() {
-  if (SHOT_MODE) return true;
-  if (process.argv.includes(HIDDEN_FLAG)) return true;
-  // macOS 由系统在登录项信息里告诉我们
-  if (process.platform === "darwin") {
-    return Boolean(app.getLoginItemSettings().wasOpenedAsHidden);
-  }
-  return false;
-}
-
-async function ensureAutostartDefault() {
-  if (process.platform !== "win32" || !app.isPackaged) return;
-
+async function removeLegacyAutostart() {
+  if (!app.isPackaged) return; // 开发时不要去动用户自己的登录项
+  const done = join(CONFIG_DIR, "autostart-disabled");
   try {
-    await access(AUTOSTART_MARKER);
-    return; // 已经初始化过，尊重用户后来的选择
+    await access(done);
+    return;
   } catch {
-    /* 第一次启动，还没有标记 */
-  }
-
-  if (!readOpenAtLogin()) {
-    writeOpenAtLogin(true);
-    await log(`首次启动：已默认开启「开机自动启动」（静默标记 ${HIDDEN_FLAG}，可在托盘菜单里关掉）`);
+    /* 还没做过 */
   }
 
   try {
-    await writeFile(AUTOSTART_MARKER, `${new Date().toISOString()}\n`);
+    // Windows 上 Electron 是按「path + args」逐字匹配登录项的，老版本登记时带了
+    // --hidden，所以两种写法都要清一遍，否则会漏掉那条。
+    if (app.getLoginItemSettings().openAtLogin) {
+      app.setLoginItemSettings({ openAtLogin: false });
+      await log("已关闭旧版本设置的「开机自动启动」：现在改为打印时按需唤醒，不再需要常驻");
+    }
+    if (process.platform === "win32") {
+      if (app.getLoginItemSettings({ args: ["--hidden"] }).openAtLogin) {
+        app.setLoginItemSettings({ openAtLogin: false, args: ["--hidden"] });
+        await log("已关闭旧版本设置的「开机自动启动」（带 --hidden 的那条）");
+      }
+    }
+  } catch (err) {
+    await log(`清理旧的开机自启项失败（不影响使用）：${err.message}`, "error");
+  }
+
+  try {
+    await writeFile(done, `${new Date().toISOString()}\n`);
   } catch {
-    /* 标记写不进去只会导致下次再设一遍，不影响功能 */
+    /* 标记写不进去只会导致下次再做一遍，无害 */
+  }
+}
+
+/* --------------------------------------------------- macOS 按需唤醒 --- */
+
+/** LaunchAgent 的 label，卸载/重装都靠它定位。 */
+const LAUNCH_AGENT_LABEL = "cn.edu.sustech.print.watch";
+
+/**
+ * 在 ~/Library/LaunchAgents 里装一个"打印时把无头进程叫起来"的 agent。
+ *
+ * 用 launchd 的 WatchPaths 盯着 CUPS backend 的落盘目录：目录一有动静，
+ * launchd 就把 worker.mjs 拉起来（**以纯 node 方式**，见
+ * EnvironmentVariables 里的 ELECTRON_RUN_AS_NODE）。它平时不占任何内存，
+ * 而且延迟是毫秒级的 —— 比轮询计划任务好得多。
+ *
+ * 为什么每次启动都重写一遍：用户可能把 App 拖到别的位置，或者升级换了版本号，
+ * 那 plist 里的绝对路径就过期了。这里顺手做自愈。内容没变时不会去动 launchd。
+ *
+ * 驱动没装（没有共享 spool 目录）时跳过：WatchPaths 指向一个不存在的路径不会触发，
+ * 装了也没用，还平白在 launchd 里留个报错的东西。
+ */
+async function installLaunchAgent() {
+  if (process.platform !== "darwin" || SHOT_MODE) return;
+  // 开发时 process.execPath 指向 node_modules 里的 electron，写进去就废了
+  if (!app.isPackaged) return;
+
+  const plistPath = join(app.getPath("home"), "Library", "LaunchAgents", `${LAUNCH_AGENT_LABEL}.plist`);
+  const domain = `gui/${process.getuid()}`;
+
+  // 驱动没装（没有共享 spool 目录）就不该留着这个 agent：WatchPaths 指向一个
+  // 不存在的路径永远不会触发，只会在 launchd 里留个反复报错的条目。
+  // 用户把驱动卸了之后，下次打开客户端就会走到这里，顺手把上一个版本留下的清掉。
+  let hasSpool = true;
+  try {
+    await access(SYSTEM_SPOOL_DIR);
+  } catch {
+    hasSpool = false;
+  }
+  if (!hasSpool) {
+    try {
+      await access(plistPath);
+    } catch {
+      return; // 既没驱动也没 agent，什么都不用做
+    }
+    await run("/bin/launchctl", ["bootout", domain, plistPath]);
+    await rm(plistPath, { force: true });
+    await log("macOS 驱动已不在，已撤掉按需唤醒配置");
+    return;
+  }
+
+  const exe = process.execPath; // .../南科大云打印.app/Contents/MacOS/南科大云打印
+  const worker = join(__dirname, "..", "..", "app.asar", "desktop", "worker.mjs");
+
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LAUNCH_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${exe}</string>
+    <string>${worker}</string>
+    <string>--wake</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ELECTRON_RUN_AS_NODE</key>
+    <string>1</string>
+  </dict>
+  <key>WatchPaths</key>
+  <array>
+    <string>${SYSTEM_SPOOL_DIR}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+`;
+
+  let existing = null;
+  try {
+    existing = await readFile(plistPath, "utf8");
+  } catch {
+    /* 还没装过 */
+  }
+
+  try {
+    await mkdir(join(app.getPath("home"), "Library", "LaunchAgents"), { recursive: true });
+    if (existing === plist) return; // 一模一样就别去打扰 launchd
+    await writeFile(plistPath, plist);
+  } catch (err) {
+    await log(`写入按需唤醒配置失败（不影响界面使用）：${err.message}`, "error");
+    return;
+  }
+
+  // 先 bootout 再 bootstrap：已经加载过时 bootstrap 会报 EIO，bootout 让它变成幂等
+  await run("/bin/launchctl", ["bootout", domain, plistPath]);
+  const ok = await run("/bin/launchctl", ["bootstrap", domain, plistPath]);
+  if (ok) {
+    await log("已启用按需唤醒：打印时会自动把上传进程叫起来，平时不占内存");
+  } else {
+    // 老系统上没有 bootstrap，退回 load
+    const legacyOk = await run("/bin/launchctl", ["load", "-w", plistPath]);
+    await log(
+      legacyOk
+        ? "已启用按需唤醒（launchctl load）"
+        : "启用按需唤醒失败：打印时不会自动上传，需要手动打开客户端",
+      legacyOk ? "info" : "error",
+    );
   }
 }
 
@@ -236,20 +368,11 @@ function createWindow() {
   win.loadURL(serverInfo.url);
 
   win.once("ready-to-show", () => {
-    // 开机自启拉起来、以及截图模式下都保持隐藏：只驻留托盘，不弹窗、不抢焦点。
-    // 窗口不 show 就不会有任务栏按钮，"没有窗口任务"就是这么来的。
-    //
-    // 这里把结论写进日志：从程序外面判断"窗口到底显示了没有"很不可靠
-    // （进程是多进程的，窗口归主进程；远程/无桌面会话下枚举结果也会骗人），
-    // 而这一行是自己报的，装完机器上出问题看日志就能定性。
-    if (startHidden) {
-      void log(
-        `主窗口已就绪，但本次是隐藏启动（argv 含 ${HIDDEN_FLAG}）：` +
-          `不进任务栏、不抢焦点（isVisible=${win?.isVisible() ?? "?"}）`,
-      );
-      return;
-    }
+    // 截图模式保持隐藏：capturePage 不需要可见窗口，
+    // 弹出来反而会抢焦点、看起来像"程序崩了"。
+    if (SHOT_MODE) return;
     win?.show();
+    touch();
     void log(`主窗口已显示（isVisible=${win?.isVisible() ?? "?"}）`);
     // macOS 上把标题栏按钮往下挪一点，和自制顶栏对齐
     if (process.platform === "darwin") win?.setWindowButtonPosition?.({ x: 16, y: 18 });
@@ -285,20 +408,27 @@ function createWindow() {
     void log(`渲染进程崩溃：${JSON.stringify(details)}`, "error");
   });
 
-  // 关窗口 = 收进托盘。直接退出的话虚拟打印机就没人在盯了。
+  // 关窗口 = 把渲染进程真的还回去。
+  //
+  // 以前这里是 hide()：窗口看不见了，但整个 Vue 界面、GPU 进程都还活着，
+  // 实测白占 325 MB。现在 destroy()，下次打开时重建 —— 本机页面，重开很快。
+  // 主进程仍然活着（托盘 + spool 监听），空闲 IDLE_EXIT_MS 之后连它一起退。
   win.on("close", (event) => {
-    if (quitting) return;
+    if (quitting || SHOT_MODE) return;
     event.preventDefault();
-    win?.hide();
+    win?.destroy();
     if (process.platform === "darwin") app.dock?.hide?.();
+    void log(`主窗口已关闭（渲染进程已释放，${IDLE_LABEL}无操作后整个退出）`);
   });
 
   win.on("closed", () => {
     win = null;
+    touch();
   });
 }
 
 function showWindow() {
+  touch();
   if (!win) {
     createWindow();
     return;
@@ -323,14 +453,14 @@ function trayIcon() {
 /**
  * 建托盘图标。
  *
- * 返回值很重要：静默启动（开机自启）时托盘是**唯一**的入口，
+ * 返回值很重要：托盘是窗口关掉之后**唯一**的入口，
  * 建不起来就意味着用户完全够不着这个程序，调用方需要据此把窗口显示出来。
  */
 function createTray() {
   try {
     tray = new Tray(trayIcon());
   } catch (err) {
-    log(`托盘创建失败（不影响主功能）：${err.message}`, "error");
+    void log(`托盘创建失败（不影响主功能）：${err.message}`, "error");
     return false;
   }
 
@@ -340,14 +470,6 @@ function createTray() {
       { type: "separator" },
       { label: "打开主界面", click: showWindow },
       { type: "separator" },
-      {
-        label: "开机自动启动",
-        type: "checkbox",
-        checked: readOpenAtLogin(),
-        click: (item) => {
-          writeOpenAtLogin(item.checked);
-        },
-      },
       { label: "打开日志", click: () => shell.openPath(DRIVER_LOG_FILE).catch(() => {}) },
       { type: "separator" },
       {
@@ -363,7 +485,7 @@ function createTray() {
   tray.setToolTip("南科大云打印");
   tray.setContextMenu(build());
   tray.on("click", showWindow);
-  // 每次弹出前重建，保证"开机自启"的勾选状态是最新的
+  // 每次弹出前重建，保证菜单状态是最新的
   tray.on("right-click", () => tray?.setContextMenu(build()));
   return true;
 }
@@ -375,10 +497,11 @@ function registerIpc() {
   ipcMain.handle("credentials:backend", () => credentials.backend());
 
   ipcMain.handle("credentials:save", async (_e, credential) => {
+    touch();
     const res = await credentials.save(credential);
     if (res.ok) {
       await armCredential();
-      await log("已保存登录凭据（系统密钥加密）");
+      await log("已保存登录凭据（系统加密存储）");
     }
     return res;
   });
@@ -386,6 +509,7 @@ function registerIpc() {
   ipcMain.handle("credentials:load", () => credentials.load());
 
   ipcMain.handle("credentials:clear", async () => {
+    touch();
     await credentials.clear();
     serverModule?.setRememberedCredential(null);
     await log("已删除本机保存的凭据");
@@ -401,12 +525,7 @@ function registerIpc() {
     serverUrl: serverInfo?.url ?? "",
     configDir: CONFIG_DIR,
     logFile: DRIVER_LOG_FILE,
-    openAtLogin: readOpenAtLogin(),
   }));
-
-  ipcMain.handle("app:setOpenAtLogin", (_e, enabled) => {
-    return { ok: true, openAtLogin: writeOpenAtLogin(enabled) };
-  });
 }
 
 /* ------------------------------------------------------------- 截图工具 --- */
@@ -488,18 +607,48 @@ async function captureScreenshots(dir) {
   }
 }
 
+/* --------------------------------------------------------------- 空闲退出 --- */
+
+/**
+ * 没窗口、也没人打印，就整个退出。
+ *
+ * 这是"后台内存占用"的最终答案：不是把 Electron 减到多小，而是让它不存在。
+ * 退出之后打印照样能用 —— 系统唤醒一个 54 MB 的纯 node 进程去上传，干完就退。
+ */
+function startIdleWatchdog() {
+  if (SHOT_MODE || !(IDLE_EXIT_MS > 0)) return;
+
+  setInterval(() => {
+    if (quitting) return;
+    if (win) {
+      touch(); // 窗口开着就不算空闲
+      return;
+    }
+    if (Date.now() - lastActivity < IDLE_EXIT_MS) return;
+    void (async () => {
+      quitting = true;
+      await log(
+        `关掉窗口后已空闲 ${IDLE_LABEL}，退出以释放内存` +
+          `（打印时会由系统自动唤醒，无需手动打开）`,
+      );
+      app.quit();
+    })();
+  }, IDLE_CHECK_MS);
+}
+
 /* ------------------------------------------------------------------ 启动 --- */
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
+  // 第二个实例：用户又点了一次图标。把已有窗口亮出来就行 ——
+  // 打印走的是 worker.mjs（纯 node），根本不会走到这里，所以不会凭空弹窗。
   app.on("second-instance", showWindow);
 
   app.whenReady().then(async () => {
     await ensureDirs();
     await log("=== 南科大云打印启动 ===");
-    await ensureAutostartDefault();
 
     try {
       await bootServer();
@@ -529,26 +678,29 @@ if (!gotLock) {
     await armCredential();
     registerIpc();
 
-    // 开机自启拉起来时只进托盘。先算好，createWindow 里据此决定显不显示。
-    startHidden = startedHidden();
-    if (startHidden && !SHOT_MODE) await log("以静默方式启动（登录项），只驻留托盘，不显示窗口");
-
     createWindow();
     const trayReady = createTray();
-
-    // 静默启动时托盘是唯一入口。托盘要是没建起来、窗口又不显示，
-    // 用户就彻底够不着这个程序了 —— 宁可破例把窗口弹出来。
-    if (!trayReady && startHidden && !SHOT_MODE) {
-      await log("托盘不可用，改为显示主窗口（否则用户没有任何入口）", "error");
-      startHidden = false;
-      showWindow();
-    }
 
     watcher = new SpoolWatcher({
       onLog: (msg, level) => void log(msg, level),
       getDriverToken: () => driverToken,
+      onJob: () => touch(),
     });
     await watcher.start();
+    touch();
+
+    // 后台把这些装好：它们不影响界面可用性，失败也只写日志
+    if (await credentials.migrateIfNeeded()) {
+      await log("已把旧版本保存的密码迁移到系统加密存储（不需要重新登录）");
+    }
+    await removeLegacyAutostart();
+    await installLaunchAgent();
+    startIdleWatchdog();
+
+    // 托盘没建起来的话，窗口关掉之后用户就够不着这个程序了 —— 提一句
+    if (!trayReady && !SHOT_MODE) {
+      await log("托盘不可用：关闭窗口后请从桌面图标重新打开", "error");
+    }
 
     // 截图模式：只为出 UI 图用（SUSTECH_SHOT=<目录>），正常启动不会走到
     if (process.env.SUSTECH_SHOT) {
@@ -563,10 +715,9 @@ if (!gotLock) {
     app.on("activate", showWindow);
   });
 
-  // 窗口关掉不等于退出：托盘还在，驱动还要靠它上传
+  // 窗口关掉不等于退出：托盘还在，驱动还要靠它接活（空闲了才会自己退）
   app.on("window-all-closed", () => {
-    if (process.platform === "darwin") return;
-    // Windows/Linux 上保持常驻；真要退出用托盘菜单
+    // macOS / Windows / Linux 都保持常驻到空闲退出
   });
 
   app.on("before-quit", () => {

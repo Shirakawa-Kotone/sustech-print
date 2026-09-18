@@ -405,11 +405,17 @@ async function tryRelogin() {
 
   reloginInFlight = (async () => {
     try {
+      // remembered 可能是对象，也可能是一个异步取凭据的函数（见
+      // setRememberedCredential）。无头进程用后者：读钥匙串/DPAPI 有成本
+      // （Windows 上要起一次 PowerShell），会话没过期就不该付这个钱。
+      const cred = typeof remembered === "function" ? await remembered() : remembered;
+      if (!cred?.username) return null;
+
       const jar = new CookieJar();
       const user = await loginWithPassword(
         jar,
-        remembered.username,
-        remembered.password,
+        cred.username,
+        cred.password,
         ORIGIN,
       );
       session = { jar, user, savedAt: Date.now() };
@@ -1159,17 +1165,61 @@ export function startServer({ port = PORT, host = HOST } = {}) {
   });
 }
 
-export function stopServer() {
-  return new Promise((resolve) => server.close(() => resolve()));
+/**
+ * 关掉本地服务。
+ *
+ * `force` 会把还挂着的连接直接掐掉，用在无头进程超时收尾的场景。
+ *
+ * 为什么不能只写 `server.close(cb)`：那个回调要等**所有**连接结束才会来，
+ * 而无头进程里完全可能正挂着一个传到一半的上传（上游慢起来要几十秒）。
+ * 实测踩到：worker 过了自己的 MAX_MS 还是不走，计划任务一直显示"正在运行"，
+ * 文件名也永远留在 processing/ 里 —— 原因就是卡在这个回调上。
+ * 所以这里除了 force 之外还留了一个兜底：无论如何 2 秒内必须返回。
+ */
+export function stopServer({ force = false } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    server.close(done);
+    if (force) server.closeAllConnections?.();
+    setTimeout(done, 2000);
+  });
+}
+
+/**
+ * 确保有一个可用会话（必要且拿得到凭据时会自动重登），返回用户对象或 null。
+ *
+ * 给无头进程用：它在开始收 spool 作业**之前**必须先确认登录状态。顺序反过来的话，
+ * 没登录时作业会被搬进 failed/ 直接丢掉；先探一次则可以把文件原样留在 spool 里，
+ * 等用户打开客户端登录后再传。
+ */
+export async function ensureSession() {
+  try {
+    return await currentUser();
+  } catch {
+    return null;
+  }
 }
 
 /**
  * 记住登录凭据（仅内存），供会话过期后自动重登。
  *
- * 由桌面壳调用：密码是用系统钥匙串（macOS Keychain / Windows DPAPI）加密后
- * 存在磁盘上的，只有壳能解出来，这里只拿它做自动重登，不落盘。
+ * 参数可以是一个 { username, password } 对象，也可以是一个**返回它的异步函数**。
+ * 后者给无头进程用：凭据从系统钥匙串/DPAPI 里取，取一次要几十毫秒到一秒
+ * （Windows 上要起 PowerShell），而绝大多数唤醒其实会话还好好的，不该白付。
+ *
+ * 由桌面壳调用：密码是用系统加密存储（macOS Keychain / Windows DPAPI）加密后
+ * 存在磁盘上的，这里只拿它做自动重登，不落盘。
  */
 export function setRememberedCredential(credential) {
+  if (typeof credential === "function") {
+    remembered = credential;
+    return;
+  }
   remembered = credential && credential.username ? credential : null;
 }
 

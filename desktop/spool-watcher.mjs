@@ -96,16 +96,35 @@ async function isPostScript(path) {
 }
 
 export class SpoolWatcher {
-  /** @param {{ onLog?: (msg: string, level?: string) => void, getDriverToken: () => string }} opts */
+  /**
+   * @param {{
+   *   onLog?: (msg: string, level?: string) => void,
+   *   getDriverToken: () => string,
+   *   onJob?: (result: { ok: boolean, name: string, reason?: string }) => void,
+   * }} opts
+   */
   constructor(opts = {}) {
     this.onLog = opts.onLog ?? (() => {});
     this.getDriverToken = opts.getDriverToken ?? (() => "");
+    /** 每个作业的最终结果。无头进程靠它决定要不要给用户弹通知。 */
+    this.onJob = opts.onJob ?? (() => {});
     this.timer = null;
     this.stopped = false;
     /** @type {Map<string, { size: number, ticks: number }>} */
     this.seen = new Map();
     /** 正在处理中的文件，避免重入。 */
     this.busy = new Set();
+  }
+
+  /**
+   * 还有没有没处理完的作业。
+   *
+   * seen = 已经看见但还没确认写稳的文件，busy = 正在搬/正在传的文件。
+   * 无头进程用它判断"能不能退出了"：必须等到这两样都空了，否则会在
+   * 上传到一半的时候退出，作业就丢在 processing/ 里等下次唤醒。
+   */
+  pending() {
+    return this.busy.size + this.seen.size;
   }
 
   async start() {
@@ -227,9 +246,11 @@ export class SpoolWatcher {
       await this.submit(taken, name, size);
       await rename(taken, join(SPOOL_DONE_DIR, basename(taken))).catch(() => {});
       this.onLog(`已提交打印：${name}（${size} 字节）`);
+      this.onJob({ ok: true, name });
     } catch (err) {
       await rename(taken, join(SPOOL_FAILED_DIR, basename(taken))).catch(() => {});
       this.onLog(`提交失败：${name} — ${err.message}`, "error");
+      this.onJob({ ok: false, name, reason: err.message });
     }
   }
 
@@ -291,6 +312,7 @@ export class SpoolWatcher {
       await unlink(path).catch(() => {});
     });
     this.onLog(`已丢弃一个无法提交的任务：${why}`, "error");
+    this.onJob({ ok: false, name: basename(path), reason: why });
   }
 }
 

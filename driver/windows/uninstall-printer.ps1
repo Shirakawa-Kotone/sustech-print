@@ -197,6 +197,25 @@ if (-not $KeepConfig -and -not $KeepSpool) {
 }
 
 # ---------------------------------------------------------------------------
+# 3.5 按需唤醒
+# ---------------------------------------------------------------------------
+#
+# 先删计划任务再去删队列：任务的动作会去摸 spool 目录，留着它没有意义。
+# 卸载脚本可能被单独调用（不经 setup-driver.ps1），所以这里也要收一遍。
+$wakeScript = Join-Path $PSScriptRoot 'install-wake.ps1'
+if (Test-Path -LiteralPath $wakeScript) {
+    $wakeOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $wakeScript -Action uninstall *>&1 | Out-String
+    Write-Host $wakeOut
+}
+else {
+    # 脚本没了也要把任务删掉，不然会在任务计划程序里留一个指向空路径的条目
+    if (Get-ScheduledTask -TaskName 'SUSTechPrint-Wake' -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName 'SUSTechPrint-Wake' -Confirm:$false
+        Write-Ok '已删除计划任务：SUSTechPrint-Wake'
+    }
+}
+
+# ---------------------------------------------------------------------------
 # 4. 结果校验
 # ---------------------------------------------------------------------------
 

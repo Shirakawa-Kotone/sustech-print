@@ -114,6 +114,15 @@ nsis:
   # 保留 %ProgramData%\SUSTechPrint（登录凭据、driver-token、spool），
   # 免得用户重装一次就得重新登录。打印机队列由 customUnInstall 负责删掉。
   deleteAppDataOnUninstall: false
+  # 装完必须把客户端拉起来一次，让用户完成登录。
+  #
+  # 不是"体验好一点"的问题：登录态是服务端会话 cookie，没有 expires。客户端现在
+  # 不常驻，打印时由计划任务唤醒一个**不跑 Electron 的无头进程**去上传；那个进程
+  # 读不到 safeStorage 的老格式凭据，要靠 App 启动时把它迁到 DPAPI/钥匙串里。
+  # 所以"装完从没打开过"就等于"打印了什么都不会发生"。
+  #
+  # perMachine 安装包由 electron-builder 用 ShellExecAsUser 以**原始用户**身份启动，
+  # 不会把 App 跑成管理员。
   runAfterFinish: true
   # 装完文件后跑驱动安装脚本，卸载时跑驱动清理脚本
   include: build/installer.nsh

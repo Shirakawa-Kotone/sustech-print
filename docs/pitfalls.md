@@ -130,3 +130,103 @@
     另外前端 `api.ts` 现在对 5xx 统一显示"客户端出了点问题，重启应用后再试一次"，
     原始报错只进控制台——本机服务把 `ENOENT ... mkdir '/.data'` 直接端给用户看，
     除了让人困惑没有任何用处。
+
+13. **`security find-generic-password -w` 对非 ASCII 的值不原样输出，而是吐十六进制。**
+
+    实测：存 `p@ss word 中文!`，读回来是
+
+    ```
+    7040737320776f726420e4b8ade6968721
+    ```
+
+    纯 ASCII 的值（`abc123`、`a b c`）则原样返回 —— 所以这个坑只在"密码里有中文"
+    时才炸，表现为"明明保存成功，却再也读不出来"，`JSON.parse` 直接抛异常、被上层
+    的 `catch` 吞成"没保存过"，用户每次都得重登。存进钥匙串前先 base64 一层就没有
+    歧义了（见 `lib/secret.mjs` 的 `macEncode` / `macLoad`）。
+
+    另外一个反直觉点：`security add-generic-password -w` **没有** stdin / 文件形式。
+    写 `-w -A` 会把字面量 `-A` 当成密码存进去，`-w` 后面不给值则变成等用户敲。
+
+14. **`safeStorage` 只在跑着 Chromium 的 Electron 主进程里可用。**
+
+    按需唤醒的那个无头进程是用 `ELECTRON_RUN_AS_NODE=1` 把同一个可执行文件
+    当纯 node 跑起来的（实测 node v24.21.0，RSS 54 MB，没有 Chromium 进程）。
+    这种模式下 `require("electron")` 只得到一个路径字符串，`app` / `safeStorage`
+    全都没有 —— 于是在 `worker.mjs` 里 `import { app } from "electron"` 会在
+    **模块解析阶段**就报
+
+    ```
+    SyntaxError: The requested module 'electron' does not provide an export named 'app'
+    ```
+
+    凭据因此改走 `lib/secret.mjs`（钥匙串 / DPAPI），GUI 和无头进程共用一份。
+
+15. **`ELECTRON_RUN_AS_NODE` 下可以直接执行 asar 里的脚本。**
+
+    不用 `asarUnpack`，也不用把 `server.mjs` / `lib/` 复制一份到 `extraResources`：
+
+    ```
+    ELECTRON_RUN_AS_NODE=1 <App>.app/Contents/MacOS/<App> \
+        <App>.app/Contents/Resources/app.asar/desktop/worker.mjs --wake
+    ```
+
+    Electron 的 `fs` 补丁在 node 模式下同样生效，asar 路径能正常读、ESM 能正常解析。
+
+16. **`launchd` 的 `WatchPaths` 指向不存在的路径时不会触发，也不会报错。**
+
+    所以 macOS 的按需唤醒只在共享 spool 目录（`/var/spool/sustech-print/incoming`）
+    存在时才装；驱动被卸载之后，客户端下次启动会把这个 agent 反向收掉。
+    另外 `launchctl bootstrap` 对**已经加载**的 agent 会返回 `5: Input/output error`，
+    想幂等地重装必须先 `bootout` 再 `bootstrap`。
+
+17. **中文路径不要写进 `.cmd` 文件，要放进计划任务的 XML。**
+
+    `cmd.exe` 按 OEM 代码页解码批处理文件，而计划任务的 XML 是 UTF-16 ——
+    把 `C:\Program Files\sustech-print\南科大云打印.exe` 写进 `.cmd` 里，
+    在非中文区域设置或代码页不匹配时就是一个找不到的程序。所以 Windows 的唤醒
+    没有生成 `wake.cmd`，而是把整条命令塞进任务定义的 `<Arguments>`：
+
+    ```
+    cmd.exe /c if exist "<spool>\out.pdf" (set "ELECTRON_RUN_AS_NODE=1" & "<App>.exe" "<worker>" --wake)
+    ```
+
+    `cmd` 会等 worker 结束，所以也不存在"任务动作一结束，子进程被 Task Scheduler
+    连带干掉"的问题。`if exist` 那道判断让绝大多数分钟级触发连进程都不用起
+    （实测没有作业时 worker 60 ms 退出，且刻意不写日志文件）。
+
+18. **计划任务里跑 `cmd.exe` 会闪黑框 —— 除非用 S4U。**
+
+    任务动作是
+
+    ```
+    cmd.exe /c if exist "<spool>\out.pdf" (set "ELECTRON_RUN_AS_NODE=1" & "<App>.exe" "<worker>" --wake)
+    ```
+
+    而 `cmd.exe` 是控制台程序。用 `InteractiveToken`（任务计划程序里的"只在用户
+    登录时运行"）注册时，任务跑在用户的交互会话里，于是**每次打印、以及每分钟的
+    兜底触发都会在屏幕上闪一下黑框**。实测确认：任务运行期间确实新起了一个
+    `conhost.exe`。
+
+    改成 `S4U`（"不管用户是否登录都运行"）后进程落在 session 0，没有桌面，
+    窗口也就无从谈起 —— 实测 worker 的 `SessionId = 0` 而当前交互会话是 1。
+    代价是 S4U 下弹不出气泡通知，但无头进程本来就没界面，失败写 `driver.log` 够了。
+
+    顺带一提：`<Hidden>true</Hidden>` 只管"在任务计划程序界面里隐藏这个任务"，
+    跟窗口一点关系都没有。
+
+19. **`server.close()` 的回调要等所有连接结束，能把"用完就退"的进程钉死。**
+
+    无头进程的收尾原来是：
+
+    ```js
+    watcher.stop();
+    await stopServer();   // -> server.close(cb)
+    ```
+
+    上游上传慢起来要几十秒（实测一次 52 秒），这时 `server.close()` 的回调
+    **永远不来**。后果：worker 过了自己的 `MAX_MS` 还是不走，计划任务一直显示
+    "正在运行"，文件名也永远留在 `processing/` 里 —— 看起来像卡死，其实是
+    卡在一个"优雅关闭"上。
+
+    修法是两件事一起做：超时收尾时 `server.closeAllConnections()` 直接掐断，
+    另外无条件加一个 2 秒兜底 `setTimeout`，保证 `stopServer()` 一定返回。

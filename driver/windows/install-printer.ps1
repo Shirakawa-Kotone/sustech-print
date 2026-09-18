@@ -481,6 +481,37 @@ Write-Ok "端口：$($port.Name)"
 $tokenState = '尚未生成（桌面 App 首次启动时会写入）'
 if (Test-Path -LiteralPath $TokenFile) { $tokenState = '已存在' }
 
+# ---------------------------------------------------------------------------
+# 6. 按需唤醒
+# ---------------------------------------------------------------------------
+#
+# 队列只是"把作业写成 out.pdf"，真正上传的是桌面 App。而 App 现在不常驻了
+# （关窗口空闲一会儿就整个退出，空闲内存 0），所以得给它装一个"有活干了"的钩子 ——
+# 打印事件触发 + 每分钟兜底的计划任务。见 install-wake.ps1 的说明。
+#
+# 失败不让整个安装失败：队列已经装好了，最多是"打印后要手动开一下客户端"，
+# 那也比回滚掉一台能用的打印机强。
+Write-Title '安装按需唤醒（打印时自动叫起上传进程）'
+
+$wakeScript = Join-Path $PSScriptRoot 'install-wake.ps1'
+if (Test-Path -LiteralPath $wakeScript) {
+    $wakeOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $wakeScript `
+        -Action install -SpoolDir $SpoolDir *>&1 | Out-String
+    $wakeCode = $LASTEXITCODE
+    if ($null -eq $wakeCode) { $wakeCode = 0 }
+    Write-Host $wakeOut
+    if ($wakeCode -eq 0) {
+        Write-Ok '已装好：打印时会自动上传，平时不占内存'
+    }
+    else {
+        Write-Warn "按需唤醒没装上（退出码 $wakeCode）。打印后需要手动打开一次客户端才会进云队列。"
+        Write-Warn "可以手工重试： powershell -ExecutionPolicy Bypass -File `"$wakeScript`" -Action install"
+    }
+}
+else {
+    Write-Warn "找不到 install-wake.ps1，跳过按需唤醒安装：$wakeScript"
+}
+
 Write-Host ''
 Write-Host '----------------------------------------------------------------' -ForegroundColor Green
 Write-Host ' 安装完成' -ForegroundColor Green
@@ -492,7 +523,8 @@ Write-Host "   本地 API   : $LocalApi"
 Write-Host "   令牌文件   : $TokenFile（$tokenState）"
 Write-Host ''
 Write-Host '   现在可以在 Word / 浏览器里选择这个打印机；每打印一份，'
-Write-Host '   out.pdf 就会被重写成这一份的内容，由桌面 App 取走上云。'
+Write-Host '   out.pdf 就会被重写成这一份的内容，由系统唤醒的上传进程取走上云。'
+Write-Host '   （客户端平时不常驻，空闲不占内存。）'
 Write-Host ''
 if (-not $driverIsPdf) {
     Write-Warn '当前使用的是 PostScript 兜底驱动，落盘文件不是 PDF，上传大概率会失败。'

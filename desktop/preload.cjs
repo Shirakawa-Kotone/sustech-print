@@ -19,6 +19,5 @@ contextBridge.exposeInMainWorld("sustechDesktop", {
 
   app: {
     info: () => ipcRenderer.invoke("app:info"),
-    setOpenAtLogin: (enabled) => ipcRenderer.invoke("app:setOpenAtLogin", enabled),
   },
 });
