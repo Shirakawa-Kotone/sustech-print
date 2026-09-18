@@ -277,8 +277,9 @@ async function submitDocument(buf, fileName, opts = {}) {
   // 直接失败（约 0.5s），线上 web 客户端的 JS 里连 taskId / WebSocket 都搜不到，
   // 它现在只是 POST 完看 oReq.status。所以这里不再把它当必要条件：
   // 握手没成功就立刻跳过等待，避免成功路径上白等 30s（waitForFinal 的超时）。
-  // 结果核实改由 jobExists()（/api/client/PrintJob/Get，实测仍可用）完成。
-  // 留着这段是因为万一上游把通道恢复，代码不需要改回来。
+  // 上传成功与否以 POST 的结果为准（见下面 outcome 的处理）；这里留着这段
+  // 只是因为万一上游把通道恢复，它报的 error 仍然是最有价值的失败信号。
+  // 千万不要再用文档列表去"兜底核实"：那个列表是最终一致的，滞后好几分钟。
   const socket = await openProgressSocket(taskId, cookie);
   const settled = socket.ok ? waitForFinal(socket.ws) : Promise.resolve({ status: "closed" });
 
@@ -348,25 +349,36 @@ async function submitDocument(buf, fileName, opts = {}) {
   const outcome = await settled;
   socket.close();
 
-  // 进度通道没给出结论时用打印队列兜底核实，避免误报失败
-  let confirmed = outcome.status === "final";
-  if (!confirmed && outcome.status !== "error" && fileName) {
-    confirmed = await jobExists(session.jar, fileName, 12_000);
+  // 上传这一步已经拿到 code=0 + 2xx，就是成功。
+  //
+  // 这里**刻意不再去文档列表里二次确认**（曾经等 12 秒、后来放宽到 45 秒）。
+  // 原因是文档列表最终一致、滞后能到好几分钟：实测一份 18:16:39 提交的作业，
+  // 18:17:30 才拿到上传响应，随后 45 秒窗口一次都没命中 —— 而它确实在队列里，
+  // szJobName 逐字一致（云打印-20260918-181639.pdf），十几分钟后再查就在了。
+  // 拿一个滞后几分钟的列表做同步判断，只会把成功的作业报成失败，而且
+  // retryable=true 还会让调用方重传，等于把一份文档变成好几份。
+  //
+  // 判断成功与否的可信信号只有上传接口本身；"到底进没进队列"由用户在「文档」
+  // 页面看（那个页面就是干这个的）。
+  if (outcome.status === "error") {
+    return {
+      ok: false,
+      taskId,
+      stage: "error",
+      reason: "processing",
+      retryable: false,
+      message: outcome.message || "文件处理失败",
+    };
   }
 
   return {
-    ok: confirmed,
+    ok: true,
     taskId,
-    stage: confirmed ? "final" : outcome.status,
-    reason: confirmed ? "ok" : "unconfirmed",
-    retryable: !confirmed,
+    stage: outcome.status === "final" ? "final" : "accepted",
+    reason: "ok",
+    retryable: false,
     progress: outcome.progress ?? null,
-    message:
-      outcome.status === "error"
-        ? outcome.message || "文件处理失败"
-        : confirmed
-          ? ""
-          : "已提交，但未收到系统确认，请在「文档」中核对",
+    message: "",
   };
 }
 
@@ -848,28 +860,29 @@ const routes = {
     // 3) 等服务端处理完成（转换 / 入库）
     const outcome = await settled;
     socket.close();
-    dbg("outcome", outcome.status);
 
-    // 4) 进度通道没给出结论时，用打印队列兜底核实，避免误报失败
-    let confirmed = outcome.status === "final";
-    if (!confirmed && outcome.status !== "error" && fileName) {
-      confirmed = await jobExists(session.jar, fileName, 12_000);
-      dbg("fallback verify", confirmed);
+    // 4) 以 HTTP 结果为准，不再拿文档列表做同步确认（理由见 submitDocument 的注释）
+    dbg("outcome", "processing=" + outcome.status);
+
+    if (outcome.status === "error") {
+      return sendJson(res, 200, {
+        ok: false,
+        taskId,
+        stage: "error",
+        reason: "processing",
+        retryable: false,
+        message: outcome.message || "文件处理失败",
+      });
     }
 
     sendJson(res, 200, {
-      ok: confirmed || outcome.status === "final",
+      ok: true,
       taskId,
-      stage: confirmed ? "final" : outcome.status,
-      reason: confirmed ? "ok" : "unconfirmed",
-      retryable: !confirmed,
+      stage: outcome.status === "final" ? "final" : "accepted",
+      reason: "ok",
+      retryable: false,
       progress: outcome.progress ?? null,
-      message:
-        outcome.status === "error"
-          ? outcome.message || "文件处理失败"
-          : confirmed
-            ? ""
-            : "已提交，但未收到系统确认，请在「文档」中核对",
+      message: "",
     });
     bustSummary();
   },
@@ -999,24 +1012,7 @@ function openProgressSocket(taskId, cookie, timeoutMs = 10_000) {
 }
 
 /** 兜底核实：打印队列里是否已经出现这份文件。 */
-async function jobExists(jar, fileName, timeoutMs = 12_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const json = await apiJson(
-        jar,
-        ORIGIN,
-        "GET",
-        `/api/client/PrintJob/Get?timestamp=${Date.now()}`,
-      );
-      if ((json?.result || []).some((j) => j.szJobName === fileName)) return true;
-    } catch {
-      /* 忽略，继续重试 */
-    }
-    await new Promise((r) => setTimeout(r, 1500));
-  }
-  return false;
-}
+/** 等待进度通道给出 final / error。 */
 
 /** 等待进度通道给出 final / error。 */
 function waitForFinal(ws, timeoutMs = 30_000) {

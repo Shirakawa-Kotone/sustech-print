@@ -192,7 +192,7 @@ Windows 那边没有降级 —— DPAPI 本来就只有"当前用户可解"这�
 | `DEBUG_UPLOAD` | — | 设为 `1` 打印上传流程日志 |
 | `SUSTECH_IDLE_EXIT_MS` | `300000` | 关窗口后空闲多久整个退出；`0` = 永不自动退出（测试时设小一点，如 `8000`） |
 | `SUSTECH_WORKER_QUIET_MS` | `3000` | 无头进程连续多久没有新作业就退出 |
-| `SUSTECH_WORKER_MAX_MS` | `180000` | 无头进程硬上限 |
+| `SUSTECH_WORKER_MAX_MS` | `240000` | 无头进程硬上限 |
 
 ## 更多
 

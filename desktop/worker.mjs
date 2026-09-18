@@ -37,8 +37,13 @@ import { SpoolWatcher } from "./spool-watcher.mjs";
 
 /** 连续这么久没有新作业就认为干完了，可以退出。 */
 const QUIET_MS = Number(process.env.SUSTECH_WORKER_QUIET_MS || 3000);
-/** 硬上限：万一有作业一直写不完（或者网络卡死），也不能永远赖着不走。 */
-const MAX_MS = Number(process.env.SUSTECH_WORKER_MAX_MS || 180_000);
+/**
+ * 硬上限：万一有作业一直写不完（或者网络卡死），也不能永远赖着不走。
+ *
+ * 要明显大于"单个作业最坏耗时"：上传本身实测能到 50 秒（上游繁忙时更久），
+ * 留 4 分钟足够跑完好几个作业，又不至于卡住了还一直占着。
+ */
+const MAX_MS = Number(process.env.SUSTECH_WORKER_MAX_MS || 240_000);
 const TICK_MS = 250;
 
 function sleep(ms) {
