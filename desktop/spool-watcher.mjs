@@ -10,7 +10,7 @@
 // 实测报 Access was denied），所以监听要够快：轮询间隔 400ms，一稳定就搬走。
 
 import { createReadStream } from "node:fs";
-import { copyFile, open, readdir, rename, stat, unlink } from "node:fs/promises";
+import { copyFile, open, readdir, readFile, rename, stat, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 
 import {
@@ -46,6 +46,13 @@ const MAX_BYTES = 200 * 1024 * 1024;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** 把打印选项写成人话，只用于日志。取值域见 takeOptions。 */
+function describeOptions(opts) {
+  if (!opts) return "";
+  const duplex = { 1: "单面", 2: "双面短边", 3: "双面长边" }[opts.duplex] || "单面";
+  return `（${opts.color === 2 ? "彩色" : "黑白"} · ${duplex} · ${opts.copies} 份）`;
 }
 
 /** 读文件开头/结尾，确认是完整的 PDF。 */
@@ -214,6 +221,46 @@ export class SpoolWatcher {
     }
   }
 
+  /**
+   * 读走驱动写的「打印选项」sidecar（`<作业>.pdf.opt`），读完就删。
+   *
+   * 只有 macOS 的 CUPS backend 会写它 —— Windows 的文件端口只拿到落盘的字节，
+   * 打印对话框里的选项一个都传不出来（见 driver/windows/README.md）。
+   *
+   * 约定：驱动**先写 sidecar、再 rename PDF**，所以看到 PDF 时它一定已经在了，
+   * 两边不需要任何锁。读不到就当没有（用默认的 黑白/单面/1 份），绝不因为一个
+   * 可选文件把作业卡住；读到之后立刻删掉，免得留下没有 PDF 的孤儿文件。
+   *
+   * @returns {Promise<{copies:number,duplex:number,color:number}|null>}
+   */
+  async takeOptions(pdfPath) {
+    const optPath = `${pdfPath}.opt`;
+    let text;
+    try {
+      text = await readFile(optPath, "utf8");
+    } catch {
+      return null; // 最常见的情况：Windows 作业，根本没有 sidecar
+    }
+    await unlink(optPath).catch(() => {});
+
+    const int = (v, min, max, dflt) => {
+      const n = Number.parseInt(String(v ?? ""), 10);
+      return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : dflt;
+    };
+    try {
+      const raw = JSON.parse(text);
+      // 取值域与上游一致：dwColor 1|2、dwDuplex 1|2|3、dwCopies 1..99
+      return {
+        copies: int(raw.copies, 1, 99, 1),
+        duplex: int(raw.duplex, 1, 3, 1),
+        color: int(raw.color, 1, 2, 1),
+      };
+    } catch {
+      this.onLog(`选项文件不是合法 JSON，按默认值（黑白/单面/1份）提交：${optPath}`, "warn");
+      return null;
+    }
+  }
+
   async handle(path, name, take = "rename") {
     const check = await looksLikeCompletePdf(path);
     if (!check.ok) {
@@ -224,6 +271,9 @@ export class SpoolWatcher {
       }
       return;
     }
+
+    // 先把选项读进内存（读完即删），再搬文件 —— 见 takeOptions 的注释
+    const opts = await this.takeOptions(path);
 
     // 立刻搬走：端口文件会被下一个作业覆盖，慢一步就可能张冠李戴
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -243,9 +293,9 @@ export class SpoolWatcher {
 
     const size = (await stat(taken)).size;
     try {
-      await this.submit(taken, name, size);
+      await this.submit(taken, name, size, opts);
       await rename(taken, join(SPOOL_DONE_DIR, basename(taken))).catch(() => {});
-      this.onLog(`已提交打印：${name}（${size} 字节）`);
+      this.onLog(`已提交打印：${name}${describeOptions(opts)}（${size} 字节）`);
       this.onJob({ ok: true, name });
     } catch (err) {
       await rename(taken, join(SPOOL_FAILED_DIR, basename(taken))).catch(() => {});
@@ -254,7 +304,7 @@ export class SpoolWatcher {
     }
   }
 
-  async submit(filePath, originalName, size) {
+  async submit(filePath, originalName, size, opts = null) {
     const token = this.getDriverToken();
     if (!token) throw new Error("拿不到本地驱动令牌，请先启动客户端");
 
@@ -279,18 +329,27 @@ export class SpoolWatcher {
 
     // 大文件用流比较稳，但 undici 对流式 body 需要 duplex 选项；
     // 打印作业一般在几十 MB 内，直接读进内存更简单可靠。
-    const { readFile } = await import("node:fs/promises");
     const body = await readFile(filePath);
     if (body.length > MAX_BYTES) throw new Error("文件过大");
 
+    /** @type {Record<string,string>} */
+    const headers = {
+      "x-driver-token": token,
+      "content-type": "application/pdf",
+      "x-file-name": encodeURIComponent(fileName),
+      "content-length": String(body.length),
+    };
+    // 打印对话框里选的选项（只有 macOS 驱动带得过来）。
+    // 不带时服务端用默认值：黑白 / 单面 / 1 份 —— 与上游官方客户端一致。
+    if (opts) {
+      headers["x-copies"] = String(opts.copies);
+      headers["x-duplex"] = String(opts.duplex);
+      headers["x-color"] = String(opts.color);
+    }
+
     const res = await fetch(url, {
       method: "POST",
-      headers: {
-        "x-driver-token": token,
-        "content-type": "application/pdf",
-        "x-file-name": encodeURIComponent(fileName),
-        "content-length": String(body.length),
-      },
+      headers,
       body,
       signal: AbortSignal.timeout(180_000),
     });

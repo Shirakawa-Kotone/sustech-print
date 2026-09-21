@@ -120,6 +120,70 @@ die() {
 }
 
 # ---------------------------------------------------------------------------
+# 打印选项：从 CUPS 的 options 串里取值
+# ---------------------------------------------------------------------------
+#
+# options 串长这样：`media=A4 sides=two-sided-long-edge ColorModel=RGB`
+# （值里有空格时 CUPS 会用引号包起来）。按 token 精确匹配 `<key>=`，再剥引号。
+#
+# 这里显式关掉 glob：串里是用户提交的作业属性，带 `*` 的值会被 shell 当文件名
+# 展开 —— backend 以 root 跑，不能让作业内容影响它碰到哪些路径。
+opt_value() {
+    _want="$1"
+    _found=""
+    set -f
+    for _tok in $JOB_OPTIONS; do
+        case "$_tok" in
+            "$_want="*) _found="${_tok#*=}" ;;
+        esac
+    done
+    set +f
+    printf '%s' "$_found" | tr -d '"'
+}
+
+# 打印选项 → 与云端一致的取值。
+#
+# **取值照抄官方网页客户端**（/client/new/cprintPc/cprint.html 的上传表单）：
+#     dwColor   1=黑白(默认) 2=彩色
+#     dwDuplex  1=单面(默认) 2=双面短边 3=双面长边
+# 别按常识猜 2/3 哪个是长边：猜反了装订方向就是错的。
+# 上游不认的取值（比如 0）只能听天由命，所以这里宁可显式给默认值。
+#
+# 这些选项**不写进 PDF**（PDF 原样透传，一个字节都不动），而是写成同名 sidecar
+# `<作业>.pdf.opt`，由桌面 App 在上传时读走、放进请求头。
+compute_options() {
+    # IPP 属性排前面，PPD 解析出来的 ColorModel 排后面（后者更具体，说了算）
+    OPT_COLOR=1
+    case "$(opt_value print-color-mode)" in
+        color) OPT_COLOR=2 ;;
+        monochrome) OPT_COLOR=1 ;;
+    esac
+    case "$(opt_value ColorModel)" in
+        RGB*|DeviceRGB*|P3E|AdobeRGB*|CMYK*) OPT_COLOR=2 ;;
+        Gray*|DeviceGray*) OPT_COLOR=1 ;;
+    esac
+
+    OPT_DUPLEX=1
+    case "$(opt_value sides)" in
+        two-sided-long-edge*)  OPT_DUPLEX=3 ;;
+        two-sided-short-edge*) OPT_DUPLEX=2 ;;
+    esac
+    if [ "$OPT_DUPLEX" = 1 ]; then
+        case "$(opt_value Duplex)" in
+            DuplexNoTumble) OPT_DUPLEX=3 ;;
+            DuplexTumble)   OPT_DUPLEX=2 ;;
+        esac
+    fi
+
+    # 份数：CUPS 把 -n 放在 argv[4]（*cupsManualCopies: False 时由 backend 负责
+    # 出多份，所以这个值只能靠我们自己带出去，否则用户要 3 份只会得到 1 份）
+    OPT_COPIES="$JOB_COPIES"
+    case "$OPT_COPIES" in ''|*[!0-9]*) OPT_COPIES=1 ;; esac
+    [ "$OPT_COPIES" -ge 1 ] 2>/dev/null || OPT_COPIES=1
+    [ "$OPT_COPIES" -le 99 ] 2>/dev/null || OPT_COPIES=99
+}
+
+# ---------------------------------------------------------------------------
 # 前置检查
 # ---------------------------------------------------------------------------
 
@@ -147,8 +211,12 @@ if ! mkdir -p "$STAGING_DIR" 2>/dev/null; then
 fi
 
 TMP_FILE=""
+OPT_FILE=""
 cleanup() {
     [ -n "$TMP_FILE" ] && [ -e "$TMP_FILE" ] && rm -f "$TMP_FILE"
+    # sidecar 只有在作业真的落盘之后才该留下；没落盘就一起清掉，别让 App
+    # 之后捡到一个没有对应 PDF 的孤儿选项文件。
+    [ -n "$OPT_FILE" ] && [ -e "$OPT_FILE" ] && rm -f "$OPT_FILE"
     return 0
 }
 trap 'cleanup' EXIT
@@ -312,7 +380,19 @@ while [ -e "$DEST" ]; do
     DEST="$SPOOL_DIR/$BASE_NAME-$N.pdf"
 done
 
+# 打印选项的 sidecar：**必须在 PDF 落定之前写完**。App 只认 *.pdf，它看到 PDF 时
+# 选项一定已经就绪，这样两边不需要任何锁。写不出来不算致命（App 会按默认的
+# 黑白/单面/1 份提交），但不能因此把作业丢掉。
+compute_options
+OPT_FILE="$DEST.opt"
+if ! printf '{"v":1,"copies":%s,"duplex":%s,"color":%s}\n' \
+        "$OPT_COPIES" "$OPT_DUPLEX" "$OPT_COLOR" >"$OPT_FILE" 2>/dev/null; then
+    OPT_FILE=""
+    log WARN "写不了选项 sidecar（$DEST.opt），将按默认 黑白/单面/1 份 提交"
+fi
+
 chmod 0644 "$TMP_FILE" 2>/dev/null || true
+[ -n "$OPT_FILE" ] && chmod 0644 "$OPT_FILE" 2>/dev/null || true
 
 # 文件属主给打印用户，这样 App（同一用户）能读写、也能把它移动到 done/failed。
 # 拿不到 uid 就算了；root 属主 + 0644 至少 App 能读走。
@@ -321,6 +401,9 @@ if [ -n "$JOB_USER" ]; then
     _gid="$(id -g "$JOB_USER" 2>/dev/null)" || _gid=""
     if [ -n "$_uid" ] && [ -n "$_gid" ]; then
         chown "$_uid:$_gid" "$TMP_FILE" 2>/dev/null || true
+        if [ -n "$OPT_FILE" ]; then
+            chown "$_uid:$_gid" "$OPT_FILE" 2>/dev/null || true
+        fi
     fi
 fi
 
@@ -328,6 +411,7 @@ if ! mv -f -- "$TMP_FILE" "$DEST" 2>/dev/null; then
     die 1 "无法把作业移动到 $DEST"
 fi
 TMP_FILE=""   # 已改名成功，不需要清理
+OPT_FILE=""   # 同上：sidecar 要留着给 App 读
 
 if [ ! -s "$DEST" ]; then
     rm -f "$DEST" 2>/dev/null
@@ -337,6 +421,6 @@ fi
 FINAL_BYTES="$(wc -c <"$DEST" 2>/dev/null | tr -d '[:space:]')"
 case "$FINAL_BYTES" in ''|*[!0-9]*) FINAL_BYTES="$JOB_BYTES" ;; esac
 
-log INFO "结果 exit=0 bytes=$FINAL_BYTES format=$FORMAT copies=$JOB_COPIES options='$JOB_OPTIONS' title='$JOB_TITLE_LOG' file='$(basename "$DEST")' 已落盘"
+log INFO "结果 exit=0 bytes=$FINAL_BYTES format=$FORMAT copies=$OPT_COPIES duplex=$OPT_DUPLEX color=$OPT_COLOR title='$JOB_TITLE_LOG' file='$(basename "$DEST")' 已落盘"
 
 exit 0

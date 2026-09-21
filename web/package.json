@@ -1,7 +1,7 @@
 {
   "name": "sustech-print-web",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.1.1",
   "type": "module",
   "description": "南科大云打印 · 前端（Vue 3 + Vite）",
   "scripts": {

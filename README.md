@@ -116,7 +116,8 @@ Windows 包只能在 Windows 上出（NSIS + PowerShell 驱动脚本）。跨机
 
 ```bash
 npm run check                                                       # Node 语法检查
-sh driver/macos/test/run-tests.sh                                   # macOS 驱动 120 项
+sh driver/macos/test/run-tests.sh                                   # macOS 驱动 139 项
+node tools/test-driver-options.mjs                                  # 驱动选项端到端 16 项（假上游，不需要校园网）
 powershell -File driver/windows/watch-spool.ps1 -SelfTest            # Windows 端口监视 62 项
 powershell -File driver/windows/install-wake.ps1 -Action install -SelfTest   # 计划任务定义校验
 ```
@@ -140,7 +141,7 @@ web/src                   前端源码（views / components / api.ts）
 driver/macos              CUPS backend + PPD + install / uninstall + 测试
 driver/windows            PowerShell：建端口和队列、spool 监视、按需唤醒、安装 / 卸载
 build/                    打包资源：图标、installer.nsh、pkg postinstall
-tools/                    开发工具：上游接口探测、图标渲染、UI 探针、mock 上游
+tools/                    开发工具：上游接口探测、图标渲染、UI 探针、mock 上游、驱动选项端到端测试
 public/                   旧版无框架前端（web/dist 不存在时的兜底）
 ```
 

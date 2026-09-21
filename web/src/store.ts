@@ -252,11 +252,30 @@ export function jobSpec(job: PrintJob): string {
   } catch {
     /* szPaperDetail 偶尔不是合法 JSON，忽略即可 */
   }
-  const attr = String(job.szAttribe || "");
+  // szAttribe 是逗号分隔的标签。**实测出来的词表**（2026-09-21，真账号上传后
+  // 从云端队列读回，见 driver/macos/REPORT.md 的 v3 追加报告）：
+  //
+  //     "single,"       单面 · 黑白
+  //     "vdup,"         双面短边 · 黑白
+  //     "hdup,color,"   双面长边 · 彩色
+  //
+  // 两个坑：
+  //   1. **黑白没有 token** —— 只有彩色才带 `color`。所以"没有 color"只有在
+  //      确实有其它标签时才等于黑白；属性串整个为空时什么都别断言。
+  //   2. 双面是 `hdup`/`vdup`（h=长边、v=短边，与上传时 dwDuplex 3/2 一一对应），
+  //      **不是** `double` —— 按 `includes("double")` 判永远不命中。
+  //
+  // 另外，旧写法 `attr.includes("color")` 会把 `nocolor`（当年凭空猜的黑白标签）
+  // 也算成彩色 —— 界面上每一份黑白作业都显示"彩色"，与打出来的结果相反。
+  const attr = String(job.szAttribe || "")
+    .toLowerCase()
+    .split(/[\s,;]+/)
+    .filter(Boolean);
   if (attr.includes("single")) parts.push("单面");
+  else if (attr.includes("hdup")) parts.push("双面 · 长边");
+  else if (attr.includes("vdup")) parts.push("双面 · 短边");
   else if (attr.includes("double")) parts.push("双面");
-  if (attr.includes("color")) parts.push("彩色");
-  else parts.push("黑白");
+  if (attr.length) parts.push(attr.includes("color") ? "彩色" : "黑白");
   return parts.join(" · ") || "—";
 }
 

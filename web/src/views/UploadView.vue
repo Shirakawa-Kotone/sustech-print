@@ -53,7 +53,9 @@ const fileInput = ref<HTMLInputElement | null>(null);
 
 const color = ref(1); // 1=黑白 2=彩色
 const paperId = ref(9); // 9=A4 8=A3 -1=不指定
-const duplex = ref(1); // 1=单面 2=双面长边 3=双面短边
+// 取值照抄官方网页客户端（client/new/cprintPc/cprint.html），别按常识猜：
+// 2 是**短边**、3 是**长边**。
+const duplex = ref(1); // 1=单面 2=双面短边 3=双面长边
 const copies = ref(1);
 
 onMounted(() => {
@@ -304,8 +306,8 @@ function ext(name: string): string {
           <div style="font-size: 12.5px; opacity: 0.6; margin-bottom: 7px">单双面</div>
           <n-radio-group v-model:value="duplex" size="small">
             <n-radio-button :value="1">单面</n-radio-button>
-            <n-radio-button :value="2">双面 · 长边翻转</n-radio-button>
-            <n-radio-button :value="3">双面 · 短边翻转</n-radio-button>
+            <n-radio-button :value="2">双面 · 短边翻转</n-radio-button>
+            <n-radio-button :value="3">双面 · 长边翻转</n-radio-button>
           </n-radio-group>
           <div style="font-size: 11.5px; opacity: 0.5; margin-top: 6px; line-height: 1.6">
             「长边」= 沿纸张长边翻，翻出来像<b>书</b>（竖版文档最常用，也是双面打印的默认）；

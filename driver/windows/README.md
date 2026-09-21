@@ -345,6 +345,16 @@ Get-Content   'C:\ProgramData\SUSTechPrint\spool\out.pdf' -Tail 1           # �
 
 5. **PostScript 兜底驱动产出的不是 PDF。** 见上面的「驱动选择」。
 
+6. **打印对话框里的选项（颜色 / 单双面 / 份数）传不出来。**
+   「文件端口」只拿到落盘的字节，`Microsoft Print To PDF` 的 DEVMODE（里面才有
+   颜色、双面、份数）留在假脱机服务里，读不到 —— 所以从 Word/浏览器打印的作业
+   一律按 **黑白 · 单面 · 1 份** 提交，和上游官方网页客户端的默认一致。
+
+   **想在 Windows 上彩打，用桌面 App 的「上传」页面**：那里有 黑白/彩色、
+   单双面、份数、纸型 可选，并且是直接提交给云端的。
+   （macOS 没有这个限制：CUPS backend 能从 options 串里读到选项，
+   见 `driver/macos/README.md` 的「打印选项」。）
+
 ---
 
 ## 安全说明

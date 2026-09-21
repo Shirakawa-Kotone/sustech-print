@@ -762,3 +762,81 @@ $ bash -c 'V=hello; echo "值=$V，，boom"'
    按字符截断，不会把中文切成半个字——已实测）。
 5. **`/var/spool` 若被系统清理工具清掉**，backend 会以 exit 1 + 明确日志失败，
    需要重新跑一次 `install.sh`。
+
+---
+
+# 追加报告（v3）：打印对话框里的「彩色」没有传到云端
+
+## A. 现象
+
+用户问"为什么不能彩打"。查下来不是上游不支持，而是**驱动这条路根本没把颜色传出去**：
+
+- PPD 里没有 `*ColorModel`，所以系统打印对话框里**连"颜色"这一项都没有**；
+- backend 只把 PDF 落盘，`options` 串（里面有 `sides`/`Duplex`/`PageSize`）只写日志；
+- 上传时只带令牌和文件名，服务端 `x-color` 缺省 **0** —— 一个上游不认识的取值。
+
+## B. 根因：自己发明了一套取值
+
+`POST /api/driver/print` 原来把选项夹在 0 起的区间里（`x-color` ∈ 0..1、缺省 0，
+`x-duplex` ∈ 0..2、缺省 0）。**上游对不认识的取值不报错**，只按默认的黑白入库 ——
+于是上传成功、队列里也有文件，本地怎么测都是"好的"，只有用户能发现。
+
+真实取值域在官方网页客户端的上传表单里（`/client/new/cprintPc/cprint.html`，
+2026-09-21 抓取）：
+
+```
+dwColor   1=黑白（默认选中）  2=彩色
+dwDuplex  1=单面（默认选中）  2=双面短边  3=双面长边
+dwPaperId -1=不指定（默认选中） 9=A4  8=A3
+页面的 JS 里没有任何"彩色不可用"的判断（只有用户偏好的 cookie set_print_color
+可以把黑白/彩色其中一项藏起来），所以服务本身是支持彩色的。
+```
+
+补充：同一页面的现代分支其实在往 `/api/client/CloudPrint/UploadFile` 提交，
+而该路径**线上已经 404**（实测 `{"Message":"No HTTP resource found ..."}`），
+IE 回退分支用的才是我们现在走的 `/api/client/CloudPrint/Upload`。这是上游自己的
+陈旧 JS，不是我们的问题。
+
+## C. 改法
+
+1. **PPD 声明 `*ColorModel/颜色: PickOne`（Gray 默认 / RGB）**，让打印对话框有
+   颜色可选；PDF 直通链路不经过 PostScript 解释器，所以那两段 `setpagedevice`
+   在正常作业里不会被执行，作业内容仍然一个字节都不动。
+2. **backend 从 `options` 串里读** `ColorModel` / `print-color-mode` / `sides` /
+   `Duplex`，加上 `argv[4]` 的份数，写成一个与作业同名的 sidecar
+   `<作业>.pdf.opt`（JSON）。**先写 sidecar、再 rename PDF**，App 看到 PDF 时
+   选项必定就绪，两边不需要任何锁；写不出来就按默认值走，不让可选文件挡住作业。
+3. **App 的 spool 监听读走 sidecar**（读完即删，不留孤儿），把 `x-copies` /
+   `x-duplex` / `x-color` 放进请求头。
+4. **服务端把取值域改成与上游一致**，并把 `submitDocument` 的缺省值从 0 改成
+   1/1/1/-1（黑白/单面/1 份/不指定）。
+5. **顺带修掉两个前端错误**：`szAttribe` 用 `includes("color")` 判断颜色，而黑白的
+   标签是 `nocolor` —— 里面也含 `color`，于是每一份黑白作业都显示成"彩色"；
+   单双面的 2/3 标签写反了（官方是 2=短边、3=长边）。
+
+## D. 验证（2026-09-21）
+
+| 验证项 | 结果 |
+|---|---|
+| macOS 驱动测试套件 | **139/139**（新增 A4b 选项 sidecar 14 项、D2b PPD 颜色 5 项） |
+| `cupstestppd -v` | 未发现错误（含 `DefaultColorModel`） |
+| 真实 CUPS 队列读回选项 | 临时队列 `lpoptions -l` → `ColorModel/颜色: *Gray RGB` |
+| 真实 cupsd 传下来的 options 串 | 用户 9-18 的真实作业日志里就有 `sides=one-sided Duplex=None PageSize=A4`，说明 PPD 选项确实会进 argv[5] |
+| `-n 3` 时 backend 被调用几次 | **1 次**（临时 socket 队列数连接数：总连接数=1），所以把份数交给云端不会重复出纸 |
+| 本地链路端到端（假上游） | `node tools/test-driver-options.mjs` → **16/16**，含逐字节核对 PDF 未被改写 |
+| **真账号 + 真云端** | `x-color=2 x-duplex=3` 上传后，队列里 `szAttribe = "hdup,color,"`、`szPaperDetail = [{"dwPaperID":9,"dwBWPages":0,"dwColorPages":1,"dwPaperNum":1}]` —— 云端按 **1 页彩色**入账 |
+| 队列 `szAttribe` 词表（3 次真账号上传） | `dwDuplex=1,dwColor=1 → "single,"`；`dwDuplex=2,dwColor=1 → "vdup,"`；`dwDuplex=3,dwColor=2 → "hdup,color,"` |
+
+最后两条是这次唯一有说服力的证据：它们证明"彩色"真的走完了全程、并且让我们
+第一次看清队列侧的词表（黑白**没有** token、双面是 `hdup`/`vdup` 而不是 `double`），
+而不是继续照着自己写的 mock 猜。
+
+三次探测在用户队列里留下的测试文档已用 `PrintJob/Del` 删除，队列恢复原状。
+
+## E. 仍然没做到的部分
+
+**Windows 的驱动路径拿不到打印对话框里的选项。** 「文件端口」只拿到落盘的字节，
+`Microsoft Print To PDF` 的 DEVMODE（颜色/双面/份数在里面）留在假脱机服务里，
+读不到 —— 所以从 Word/浏览器打印的作业一律按 黑白·单面·1 份 提交（与官方网页
+客户端的默认一致）。想彩打只能用 App 的「上传」页面（那里有完整的选项）。
+要彻底解决就得写自定义端口监视器（联创方案在做的事，代价是驱动签名与长期维护）。

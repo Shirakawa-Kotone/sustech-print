@@ -237,6 +237,13 @@ function buildMultipart(parts, boundary) {
  * 与 /api/upload 的区别：那个是浏览器把 multipart 原样透传过来，这个由服务端自己
  * 拼请求体，供打印驱动（Windows 端口落盘 / macOS CUPS backend）调用。
  *
+ * 取值域**照抄官方网页客户端**（/client/new/cprintPc/cprint.html 的表单），别自己
+ * 发明一套 0 起的编号 —— 上游对不认识的取值不会报错，只会按默认值处理，于是
+ * "选了彩色却打出黑白"这种问题在本地完全看不出来：
+ *     dwColor   1=黑白(默认) 2=彩色
+ *     dwDuplex  1=单面(默认) 2=双面短边 3=双面长边
+ *     dwPaperId -1=不指定(默认) 9=A4 8=A3
+ *
  * @param {Buffer} buf PDF 内容
  * @param {string} fileName 队列里显示的文件名
  * @param {{copies?:number,duplex?:number,color?:number,paperId?:number}} opts
@@ -248,9 +255,9 @@ async function submitDocument(buf, fileName, opts = {}) {
   const body = buildMultipart(
     [
       { name: "szPath", filename: fileName, data: buf, type: "application/pdf" },
-      { name: "dwColor", value: String(opts.color ?? 0) },
-      { name: "dwPaperId", value: String(opts.paperId ?? 0) },
-      { name: "dwDuplex", value: String(opts.duplex ?? 0) },
+      { name: "dwColor", value: String(opts.color ?? 1) },
+      { name: "dwPaperId", value: String(opts.paperId ?? -1) },
+      { name: "dwDuplex", value: String(opts.duplex ?? 1) },
       { name: "dwFrom", value: "0" },
       { name: "dwTo", value: "0" },
       { name: "dwCopies", value: String(opts.copies ?? 1) },
@@ -936,11 +943,14 @@ const routes = {
     }
     if (!/\.pdf$/i.test(fileName)) fileName += ".pdf";
 
+    // 打印对话框里的选项。取值域与上游一致（见 submitDocument 的注释）：
+    // 缺省分别是 1 份 / 单面 / 黑白 / 不指定纸型 —— 也就是官方客户端的默认。
+    // 老版本驱动这些头一个都不发，走的就是这里的 fallback。
     const opts = {
       copies: clampInt(req.headers["x-copies"], 1, 1, 99),
-      duplex: clampInt(req.headers["x-duplex"], 0, 0, 2),
-      color: clampInt(req.headers["x-color"], 0, 0, 1),
-      paperId: clampInt(req.headers["x-paper-id"], 0, 0, 9999),
+      duplex: clampInt(req.headers["x-duplex"], 1, 1, 3),
+      color: clampInt(req.headers["x-color"], 1, 1, 2),
+      paperId: clampInt(req.headers["x-paper-id"], -1, -1, 9999),
     };
 
     const result = await submitDocument(buf, fileName, opts);

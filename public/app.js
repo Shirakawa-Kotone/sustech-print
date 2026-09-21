@@ -16,10 +16,11 @@ const COLOR_OPTIONS = [
   { value: 1, label: "黑白" },
   { value: 2, label: "彩色" },
 ];
+// 取值照抄官方网页客户端：2 是短边、3 是长边（别按常识猜）
 const DUPLEX_OPTIONS = [
   { value: 1, label: "单面" },
-  { value: 2, label: "双面长边" },
-  { value: 3, label: "双面短边" },
+  { value: 2, label: "双面短边" },
+  { value: 3, label: "双面长边" },
 ];
 
 /* ================================================================ 状态 == */
@@ -662,11 +663,21 @@ function jobSpec(j) {
   } catch {
     /* 忽略 */
   }
-  const attr = String(j.szAttribe || "");
+  // szAttribe 实测词表："single,"（单面黑白）/ "vdup,"（双面短边黑白）/
+  // "hdup,color,"（双面长边彩色）。两个坑：
+  //   · 黑白**没有** token，只有彩色才带 color，所以"没有 color"要在有其它
+  //     标签时才等于黑白；
+  //   · 双面是 hdup/vdup，不是 double。
+  // 旧写法 includes("color") 会把猜出来的 nocolor 也算成彩色（黑白全显示成彩色）。
+  const attr = String(j.szAttribe || "")
+    .toLowerCase()
+    .split(/[\s,;]+/)
+    .filter(Boolean);
   if (attr.includes("single")) parts.push("单面");
+  else if (attr.includes("hdup")) parts.push("双面 · 长边");
+  else if (attr.includes("vdup")) parts.push("双面 · 短边");
   else if (attr.includes("double")) parts.push("双面");
-  if (attr.includes("color")) parts.push("彩色");
-  else parts.push("黑白");
+  if (attr.length) parts.push(attr.includes("color") ? "彩色" : "黑白");
   return parts.join(" · ") || "—";
 }
 
@@ -698,7 +709,7 @@ function viewUpload() {
           <div class="field">
             <label>颜色</label>
             <div class="tag-row" data-opt="dwColor">
-              ${COLOR_OPTIONS.map((o) => `<button class="chip ${o.value === 2 ? "active" : ""}" data-val="${o.value}">${o.label}</button>`).join("")}
+              ${COLOR_OPTIONS.map((o) => `<button class="chip ${o.value === 1 ? "active" : ""}" data-val="${o.value}">${o.label}</button>`).join("")}
             </div>
           </div>
           <div class="field">

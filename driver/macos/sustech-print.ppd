@@ -81,6 +81,18 @@
 *Duplex DuplexNoTumble/双面 · 长边翻转（像书本）: "<</Duplex true /Tumble false>>setpagedevice"
 *Duplex DuplexTumble/双面 · 短边翻转（像便签）: "<</Duplex true /Tumble true>>setpagedevice"
 *CloseUI: *Duplex
+*% 颜色。**这一项只影响提交给云端的 dwColor**（按黑白还是彩色计费/出纸），
+*% 作业内容一个字节都不动 —— 本队列是 PDF 直通，PDF 不经过任何 PostScript
+*% 解释器，所以下面两段 setpagedevice 在正常作业里不会被执行；写出来只是为了让
+*% CUPS / 系统打印对话框有一个正规的「颜色」选项可显示，backend 从
+*% options 串里读 `ColorModel=Gray|RGB`。
+*% 取值对应上游：1=黑白（默认，也是官方客户端的默认）2=彩色。
+*OpenUI *ColorModel/颜色: PickOne
+*OrderDependency: 20 AnySetup *ColorModel
+*DefaultColorModel: Gray
+*ColorModel Gray/黑白: "<</cupsColorSpace 3/cupsBitsPerColor 8/cupsColorOrder 0/cupsCompression 0>>setpagedevice"
+*ColorModel RGB/彩色: "<</cupsColorSpace 1/cupsBitsPerColor 8/cupsColorOrder 0/cupsCompression 0>>setpagedevice"
+*CloseUI: *ColorModel
 *% 关键：声明本设备直接接受 PDF，直通滤镜（命令 `-`，cost 0）。
 *% -- 这一条保证 PDF 原样到达 backend --------------------------------------
 *cupsFilter2: "application/pdf application/vnd.cups-pdf 0 -"

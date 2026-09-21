@@ -43,6 +43,10 @@ assert_eq() {
 assert_contains() {
     if grep -q -- "$3" "$2" 2>/dev/null; then ok "$1"; else bad "$1：在 $2 里找不到 [$3]"; fi
 }
+# 与 assert_contains 的区别：$2 是字符串本身，不是文件路径
+assert_match() {
+    if printf '%s' "$2" | grep -q -- "$3" 2>/dev/null; then ok "$1"; else bad "$1：[$2] 里找不到 [$3]"; fi
+}
 assert_not_exists() {
     if [ ! -e "$2" ]; then ok "$1"; else bad "$1：$2 竟然存在"; fi
 }
@@ -64,9 +68,15 @@ BACKEND_ERR="$WORK/logs/backend.err"
 DRIVER_LOG="$SPOOL/driver.log"
 
 # 每次调用前清空 incoming，便于断言"这次产出了什么"
-clear_incoming() { rm -f "$INCOMING"/*.pdf 2>/dev/null; }
-incoming_list()  { ls -1 "$INCOMING" 2>/dev/null | grep -v '^\.[a-z]' ; }
+# 注意 *.opt：那是选项 sidecar（<作业>.pdf.opt），跟着 PDF 一起产出
+clear_incoming() { rm -f "$INCOMING"/*.pdf "$INCOMING"/*.opt 2>/dev/null; }
+# 只数作业本身；sidecar 不算一个"产出"
+incoming_list()  { ls -1 "$INCOMING" 2>/dev/null | grep -v '^\.[a-z]' | grep -v '\.opt$' ; }
 incoming_count() { incoming_list | wc -l | tr -d ' '; }
+# 某个作业的选项 sidecar 内容（进程替换不行，POSIX sh 里用文件）
+opt_of()     { cat "$INCOMING/$1.opt" 2>/dev/null; }
+opt_count()  { ls -1 "$INCOMING"/*.opt 2>/dev/null | wc -l | tr -d ' '; }
+only_pdf()   { incoming_list | head -n1; }
 
 # ---------------------------------------------------------------------------
 # 按 cupsd 的约定驱动 backend。
@@ -171,6 +181,69 @@ clear_incoming
 run_backend "$FIXTURES/sample-zh.pdf" "copies 测试" 1 "copies=abc"
 assert_eq "copies=abc 仍成功落盘" 0 "$RC"
 assert_eq "产出 1 个文件" 1 "$(incoming_count)"
+
+say ""
+say "A4b. 打印选项 → 选项 sidecar（<作业>.pdf.opt）"
+#
+# 取值域是**官方网页客户端**的表单值，改之前先看 cprint.html：
+#   dwColor  1=黑白 2=彩色 / dwDuplex 1=单面 2=双面短边 3=双面长边
+# 2/3 哪个是长边最容易记反，这里用两条断言把它钉死。
+
+clear_incoming
+run_backend "$FIXTURES/sample-zh.pdf" "彩色" 3 "media=A4 sides=two-sided-short-edge ColorModel=RGB"
+assert_eq "彩色作业退出码" 0 "$RC"
+assert_eq "彩色作业产出 1 个 PDF" 1 "$(incoming_count)"
+assert_eq "彩色作业产出 1 个 sidecar" 1 "$(opt_count)"
+assert_eq "彩色 + 短边 + 3 份" \
+    '{"v":1,"copies":3,"duplex":2,"color":2}' "$(opt_of "$(only_pdf)")"
+
+clear_incoming
+run_backend "$FIXTURES/sample-zh.pdf" "长边" 1 "sides=two-sided-long-edge ColorModel=Gray"
+assert_eq "长边 + 黑白" '{"v":1,"copies":1,"duplex":3,"color":1}' "$(opt_of "$(only_pdf)")"
+
+clear_incoming
+run_backend "$FIXTURES/sample-zh.pdf" "默认" 1 ""
+assert_eq "没有选项时的默认（黑白/单面/1 份）" \
+    '{"v":1,"copies":1,"duplex":1,"color":1}' "$(opt_of "$(only_pdf)")"
+
+# 只有 Duplex（老驱动/其他前端可能不发 sides）
+clear_incoming
+run_backend "$FIXTURES/sample-zh.pdf" "Duplex 选项" 1 "Duplex=DuplexTumble"
+assert_eq "DuplexTumble → 2（短边）" '{"v":1,"copies":1,"duplex":2,"color":1}' "$(opt_of "$(only_pdf)")"
+
+# IPP 属性：print-color-mode=color（PPD 没有 ColorModel 时的等价信号）
+clear_incoming
+run_backend "$FIXTURES/sample-zh.pdf" "IPP 彩色" 1 "print-color-mode=color"
+assert_eq "print-color-mode=color → 彩色" \
+    '{"v":1,"copies":1,"duplex":1,"color":2}' "$(opt_of "$(only_pdf)")"
+
+# copies 非法值 → 回落到 1，而不是把作业弄失败
+clear_incoming
+run_backend "$FIXTURES/sample-zh.pdf" "份数乱写" "abc" ""
+assert_eq "argv[4] 非法 → 1 份" '{"v":1,"copies":1,"duplex":1,"color":1}' "$(opt_of "$(only_pdf)")"
+clear_incoming
+run_backend "$FIXTURES/sample-zh.pdf" "份数越界" 999 ""
+assert_eq "argv[4] 越界 → 99 份" '{"v":1,"copies":99,"duplex":1,"color":1}' "$(opt_of "$(only_pdf)")"
+
+# 选项串里的通配符/引号不能把 backend 带沟里（backend 以 root 跑，glob 很危险）
+clear_incoming
+run_backend "$FIXTURES/sample-zh.pdf" "古怪选项" 1 'media=* job-originating-host-name=* title="a * b" ColorModel=RGB'
+assert_eq "带通配符的选项串仍成功" 0 "$RC"
+assert_eq "带通配符时颜色照样解析出来" '{"v":1,"copies":1,"duplex":1,"color":2}' "$(opt_of "$(only_pdf)")"
+
+# sidecar 不能动到作业本身：PDF 必须与输入逐字节一致
+clear_incoming
+run_backend "$FIXTURES/sample-zh.pdf" "字节一致" 1 "ColorModel=RGB"
+if cmp -s "$FIXTURES/sample-zh.pdf" "$INCOMING/$(only_pdf)"; then
+    ok "带选项提交后 PDF 仍与输入逐字节一致（内容没被改）"
+else
+    bad "带选项提交后 PDF 字节变了 —— 选项不该碰内容"
+fi
+
+# sidecar 与 PDF 同名成对；PDF 被移走后不该在 incoming 留下孤儿 sidecar
+clear_incoming
+run_backend "$FIXTURES/sample-zh.pdf" "配对" 1 "ColorModel=RGB"
+assert_match "sidecar 与 PDF 同名成对" "$(ls -1 "$INCOMING" | tr '\n' ' ')" "\.pdf\.opt"
 
 say ""
 say "A5. 空作业 → exit 1，且不产出文件"
@@ -430,6 +503,18 @@ if command -v cupstestppd >/dev/null 2>&1; then
 else
     skip "没有 cupstestppd"
 fi
+
+say ""
+say "D2b. PPD 必须把「颜色」暴露到系统打印对话框"
+#
+# 少了这一项，用户在 Word/预览的打印对话框里根本没有黑白/彩色可选，
+# 于是永远只能打出黑白（实测踩到）。backend 从 options 串里读 ColorModel，
+# 所以这里断言 PPD 声明了它、黑白是默认、取值域与上游对得上。
+assert_contains "PPD 声明了 ColorModel" "$PPD" '^\*OpenUI \*ColorModel'
+assert_contains "PPD 里 ColorModel 有 Gray" "$PPD" '^\*ColorModel Gray'
+assert_contains "PPD 里 ColorModel 有 RGB" "$PPD" '^\*ColorModel RGB'
+assert_contains "ColorModel 默认是 Gray（黑白）" "$PPD" '^\*DefaultColorModel: Gray'
+assert_contains "ColorModel 有 OrderDependency" "$PPD" '^\*OrderDependency: .* \*ColorModel'
 
 say ""
 say "D3. PDF 输入的滤镜链（必须直通，不能有 cgpdftops）"

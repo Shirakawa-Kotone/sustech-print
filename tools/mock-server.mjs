@@ -45,12 +45,16 @@ const PRINTERS = Array.from({ length: 26 }, (_, i) => {
   };
 });
 
+// szAttribe 的取值是**真账号实测**出来的词表（见 driver/macos/REPORT.md v3）：
+//   "single," 单面黑白   "vdup," 双面短边黑白   "hdup,color," 双面长边彩色
+// 早期这里写的是自己猜的 "single,nocolor"/"double,color" —— 猜错了，害得界面
+// 判断也跟着错（黑白因为含 color 子串被显示成彩色）。别改回去。
 const JOBS = [
-  { dwJobId: 88001, szJobName: "数据结构实验报告.pdf", szPaperDetail: '[{"dwPaperID":9}]', szAttribe: "single,nocolor", dwPages: 12, dwCopies: 1, dwCreateDate: "20260917", dwCreateTime: "141233" },
-  { dwJobId: 88002, szJobName: "毕业论文-第三章.docx", szPaperDetail: '[{"dwPaperID":9}]', szAttribe: "double,color", dwPages: 34, dwCopies: 2, dwCreateDate: "20260917", dwCreateTime: "093001" },
-  { dwJobId: 88003, szJobName: "课程表（更新）.xlsx", szPaperDetail: '[{"dwPaperID":9}]', szAttribe: "single,nocolor", dwPages: 2, dwCopies: 1, dwCreateDate: "20260916", dwCreateTime: "182045" },
-  { dwJobId: 88004, szJobName: "组会汇报-0916.pptx", szPaperDetail: '[{"dwPaperID":8}]', szAttribe: "single,color", dwPages: 18, dwCopies: 1, dwCreateDate: "20260916", dwCreateTime: "101512" },
-  { dwJobId: 88005, szJobName: "英语作文批改.pdf", szPaperDetail: '[{"dwPaperID":9}]', szAttribe: "single,nocolor", dwPages: 4, dwCopies: 1, dwCreateDate: "20260915", dwCreateTime: "204411" },
+  { dwJobId: 88001, szJobName: "数据结构实验报告.pdf", szPaperDetail: '[{"dwPaperID":9}]', szAttribe: "single,", dwPages: 12, dwCopies: 1, dwCreateDate: "20260917", dwCreateTime: "141233" },
+  { dwJobId: 88002, szJobName: "毕业论文-第三章.docx", szPaperDetail: '[{"dwPaperID":9}]', szAttribe: "hdup,color,", dwPages: 34, dwCopies: 2, dwCreateDate: "20260917", dwCreateTime: "093001" },
+  { dwJobId: 88003, szJobName: "课程表（更新）.xlsx", szPaperDetail: '[{"dwPaperID":9}]', szAttribe: "single,", dwPages: 2, dwCopies: 1, dwCreateDate: "20260916", dwCreateTime: "182045" },
+  { dwJobId: 88004, szJobName: "组会汇报-0916.pptx", szPaperDetail: '[{"dwPaperID":8}]', szAttribe: "single,color,", dwPages: 18, dwCopies: 1, dwCreateDate: "20260916", dwCreateTime: "101512" },
+  { dwJobId: 88005, szJobName: "英语作文批改.pdf", szPaperDetail: '[{"dwPaperID":9}]', szAttribe: "single,", dwPages: 4, dwCopies: 1, dwCreateDate: "20260915", dwCreateTime: "204411" },
 ];
 
 const SCANS = [
